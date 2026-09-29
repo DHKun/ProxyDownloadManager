@@ -9,7 +9,7 @@ import { useAppContext } from "../contexts/AppContext";
 import { useContextMenu } from "../hooks/useContextMenu";
 import { Checkbox } from "./ui/checkbox";
 import { overallPercent } from "../utils/progressMap";
-import { formatBytes, statusString, isFailed, isActiveStatus, failureText } from "../utils/format";
+import { formatBytes, statusString, statusLabel, isFailed, isActiveStatus, failureText } from "../utils/format";
 import { computeETA } from "../hooks/useDownloadSpeed";
 import type { DownloadItem } from "../types";
 import type { StatusFilter, TypeFilter } from "../utils/url";
@@ -50,7 +50,7 @@ function StatusCell({ item }: { item: DownloadItem }) {
       </div>
     );
   }
-  return <span>{s}</span>;
+  return <span>{statusLabel(item.status)}</span>;
 }
 
 export default function DownloadTable({ filter, query = "", typeFilter = "all" }: DownloadTableProps) {

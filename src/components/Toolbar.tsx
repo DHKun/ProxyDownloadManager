@@ -1,5 +1,4 @@
-import { Plus, Play, Square, Trash2, Settings, Gauge, MoreHorizontal, ScrollText, Globe, Info, LogOut } from "lucide-react";
-import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
+import { Plus, Play, Square, Trash2, Settings, Gauge, ScrollText, Globe, Info, LogOut } from "lucide-react";
 import { t } from "../i18n";
 import { useAppContext } from "../contexts/AppContext";
 import { Button } from "./ui/button";
@@ -20,8 +19,6 @@ const RATE_OPTIONS = [
   { v: 5 * 1024 * 1024, label: "5 MB/s" },
   { v: 10 * 1024 * 1024, label: "10 MB/s" },
 ];
-
-const menuItem = "cursor-pointer rounded-sm px-3 py-1.5 text-[13px] outline-none data-[highlighted]:bg-muted";
 
 export default function Toolbar({
   hasDownloadingSelected, hasPausedSelected, hasDeletable,
@@ -66,37 +63,21 @@ export default function Toolbar({
         </Select>
       </div>
       <div className="flex-1" />
-      <Button variant="ghost" size="icon" onClick={onSettings} title={t("toolbar.settings")}>
-        <Settings className="h-4 w-4" />
+      <Button variant="ghost" onClick={onLog}>
+        <ScrollText className="h-4 w-4" /> {t("toolbar.log")}
       </Button>
-      <DropdownMenu.Root>
-        <DropdownMenu.Trigger asChild>
-          <Button variant="ghost" size="icon" title={t("toolbar.more")}>
-            <MoreHorizontal className="h-4 w-4" />
-          </Button>
-        </DropdownMenu.Trigger>
-        <DropdownMenu.Portal>
-          <DropdownMenu.Content
-            className="z-50 min-w-[160px] rounded-md border border-border bg-card py-1 shadow-sm"
-            align="end"
-            sideOffset={4}
-          >
-            <DropdownMenu.Item className={menuItem} onSelect={onExtension}>
-              <span className="inline-flex items-center gap-2"><Globe className="h-3.5 w-3.5" /> {t("toolbar.extension")}</span>
-            </DropdownMenu.Item>
-            <DropdownMenu.Item className={menuItem} onSelect={onLog}>
-              <span className="inline-flex items-center gap-2"><ScrollText className="h-3.5 w-3.5" /> {t("toolbar.log")}</span>
-            </DropdownMenu.Item>
-            <DropdownMenu.Item className={menuItem} onSelect={onAbout}>
-              <span className="inline-flex items-center gap-2"><Info className="h-3.5 w-3.5" /> {t("toolbar.about")}</span>
-            </DropdownMenu.Item>
-            <DropdownMenu.Separator className="my-1 h-px bg-border" />
-            <DropdownMenu.Item className={menuItem} onSelect={() => { void onQuit(); }}>
-              <span className="inline-flex items-center gap-2"><LogOut className="h-3.5 w-3.5" /> {t("toolbar.quit")}</span>
-            </DropdownMenu.Item>
-          </DropdownMenu.Content>
-        </DropdownMenu.Portal>
-      </DropdownMenu.Root>
+      <Button variant="ghost" onClick={onSettings}>
+        <Settings className="h-4 w-4" /> {t("toolbar.settings")}
+      </Button>
+      <Button variant="ghost" onClick={onExtension}>
+        <Globe className="h-4 w-4" /> {t("toolbar.extension")}
+      </Button>
+      <Button variant="ghost" onClick={onAbout}>
+        <Info className="h-4 w-4" /> {t("toolbar.about")}
+      </Button>
+      <Button variant="ghost" onClick={onQuit}>
+        <LogOut className="h-4 w-4" /> {t("toolbar.quit")}
+      </Button>
     </div>
   );
 }

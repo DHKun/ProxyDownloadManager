@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { formatBytes } from "../utils/format";
+import { formatBytes, isActiveStatus } from "../utils/format";
 import { t } from "../i18n";
 import type { DownloadItem } from "../types";
 
@@ -60,7 +60,7 @@ export function useDownloadSpeed(downloads: DownloadItem[]): SpeedMap {
     const liveIds = new Set<number>();
 
     for (const item of downloads) {
-      if (item.status !== "downloading") {
+      if (!isActiveStatus(item.status)) {
         samplesRef.current.delete(item.id);
         prevBpsRef.current.delete(item.id);
         continue;

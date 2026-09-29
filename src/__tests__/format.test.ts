@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { isFailed, getErrorMessage, statusString, statusColor, formatTimestamp, failureText } from "../utils/format";
+import { isFailed, getErrorMessage, statusString, statusLabel, statusColor, formatTimestamp, failureText, errorDetail } from "../utils/format";
+import { setLanguage } from "../i18n";
 
 describe("isFailed", () => {
   it("returns true for failed status", () => {
@@ -36,6 +37,29 @@ describe("failureText", () => {
       code: null,
       message: "connection reset",
     });
+  });
+});
+
+describe("errorDetail", () => {
+  it("drops a message that only repeats the HTTP code", () => {
+    expect(errorDetail(403, "HTTP 403")).toBe("");
+    expect(errorDetail(404, "HTTP 404 not found")).toBe("not found");
+    expect(errorDetail(403, "Forbidden (HTTP 403)")).toBe("Forbidden");
+  });
+
+  it("keeps a message that has no code", () => {
+    expect(errorDetail(null, "connection reset")).toBe("connection reset");
+  });
+});
+
+describe("statusLabel", () => {
+  it("uses the active language and falls back for unknown values", () => {
+    setLanguage("en");
+    expect(statusLabel("paused")).toBe("Paused");
+    expect(statusLabel({ failed: "HTTP 403" })).toBe("Failed");
+    setLanguage("zh");
+    expect(statusLabel("downloading")).toBe("下载中");
+    setLanguage("en");
   });
 });
 

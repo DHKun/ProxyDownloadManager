@@ -1,4 +1,16 @@
 import type { DownloadStatus } from "../types";
+import { t } from "../i18n";
+
+const LABELED_STATUSES = new Set([
+  "connecting",
+  "retrying",
+  "merging",
+  "failed",
+  "downloading",
+  "paused",
+  "completed",
+  "queued",
+]);
 
 export function isFailed(status: DownloadStatus): boolean {
   return typeof status === "object" && "failed" in status;
@@ -12,6 +24,12 @@ export function statusString(status: DownloadStatus): string {
   return typeof status === "object" && "failed" in status ? "failed" : status;
 }
 
+/** Localized status name. Unknown values stay as the engine string. */
+export function statusLabel(status: DownloadStatus): string {
+  const s = statusString(status);
+  return LABELED_STATUSES.has(s) ? t(`status.${s}`) : s;
+}
+
 /** HTTP status embedded in an engine error, plus the full message for a tooltip. */
 export function failureText(
   status: DownloadStatus,
@@ -20,6 +38,17 @@ export function failureText(
   const message = getErrorMessage(status) || errorMessage || "";
   const match = message.match(/HTTP\s+(\d{3})/i);
   return { code: match ? Number(match[1]) : null, message };
+}
+
+/** Body under an HTTP code line. A message that is only "HTTP 403" is not repeated. */
+export function errorDetail(code: number | null, message: string): string {
+  const text = message.trim();
+  if (!text || code == null) return text;
+  return text
+    .replace(new RegExp(`\\bHTTP\\s+${code}\\b`, "ig"), "")
+    .replace(/\s+/g, " ")
+    .replace(/^[\s:()\-–,]+|[\s:()\-–,]+$/g, "")
+    .trim();
 }
 
 export function isActiveStatus(status: DownloadStatus): boolean {

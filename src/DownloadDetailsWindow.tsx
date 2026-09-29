@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { failureText, formatBytes, isActiveStatus, isFailed, statusString } from "./utils/format";
+import { errorDetail, failureText, formatBytes, formatRateLimit, isActiveStatus, isFailed, statusLabel, statusString } from "./utils/format";
 import { useDownloadDetail, useDownloadIdFromUrl } from "./hooks/useDownloadDetail";
 import { useDownloadSpeed, computeETA } from "./hooks/useDownloadSpeed";
 import { useSettings } from "./query/downloadQueries";
@@ -15,6 +15,11 @@ import { Label } from "./components/ui/label";
 import { tauriClient } from "./tauriClient";
 
 const CONN_OPTIONS = [0, 1, 4, 8, 16, 32, 64];
+const RATE_OPTIONS = [0, 256 * 1024, 1024 * 1024, 5 * 1024 * 1024, 10 * 1024 * 1024];
+
+function withCurrent(options: number[], current: number): number[] {
+  return options.includes(current) ? options : [...options, current].sort((a, b) => a - b);
+}
 
 function isSegmentItem(contentType: string | undefined, fileName: string): boolean {
   const ct = (contentType || "").toLowerCase();
@@ -71,6 +76,11 @@ export default function DownloadDetailsWindow() {
   const showRefresh = failed || statusString(item.status) === "paused";
   const segments = isSegmentItem(item.content_type, item.file_name);
   const { code, message } = failureText(item.status, item.error_message);
+  const detail = errorDetail(code, message);
+  const connValue = conns ?? item.connections;
+  const connOptions = withCurrent(CONN_OPTIONS, connValue);
+  const rateValue = Number(rate) || 0;
+  const rateOptions = withCurrent(withCurrent(RATE_OPTIONS, rateValue), item.rate_limit_bps || 0);
   const sizeText = segments
     ? (item.total_size > 0
       ? t("properties.segments").replace("{done}", String(item.downloaded)).replace("{total}", String(item.total_size))
@@ -99,7 +109,7 @@ export default function DownloadDetailsWindow() {
   return (
     <div className="flex h-full flex-col gap-3 overflow-auto p-3 text-[13px]">
       <div className="min-w-0 truncate text-[14px] font-semibold">{item.file_name}</div>
-      <div>{statusString(item.status)} · {progress}%</div>
+      <div>{statusLabel(item.status)} · {progress}%</div>
       <Progress className="h-2.5" value={progress} />
       <div className="grid grid-cols-2 gap-x-3 gap-y-1">
         <span className="text-muted-foreground">{t("downloadTable.speed")}</span>
@@ -122,7 +132,7 @@ export default function DownloadDetailsWindow() {
         <div className="rounded-md border border-border bg-muted p-2 text-[12px]">
           <div className="text-muted-foreground">{t("properties.error")}</div>
           {code != null && <div>HTTP {code}</div>}
-          {message && <div className="break-all">{message}</div>}
+          {detail && <div className="break-all">{detail}</div>}
         </div>
       )}
       <div className="flex flex-wrap gap-1.5">
@@ -134,25 +144,24 @@ export default function DownloadDetailsWindow() {
       <div className="grid grid-cols-2 gap-2">
         <div>
           <Label>{t("properties.connections")}</Label>
-          <Select value={String(conns ?? item.connections)} onChange={(e) => applyConnections(Number(e.target.value))}>
-            {CONN_OPTIONS.map((n) => (
+          <Select value={String(connValue)} onChange={(e) => applyConnections(Number(e.target.value))}>
+            {connOptions.map((n) => (
               <option key={n} value={n}>{n === 0 ? t("newDownload.auto") : n}</option>
             ))}
           </Select>
         </div>
         <div>
           <Label>{t("properties.speedLimit")}</Label>
-          <Select value={rate} onChange={(e) => applyRate(e.target.value)}>
-            <option value="0">{t("rateLimit.unlimited")}</option>
-            <option value={String(256 * 1024)}>256 KB/s</option>
-            <option value={String(1024 * 1024)}>1 MB/s</option>
-            <option value={String(5 * 1024 * 1024)}>5 MB/s</option>
+          <Select value={String(rateValue)} onChange={(e) => applyRate(e.target.value)}>
+            {rateOptions.map((bps) => (
+              <option key={bps} value={bps}>{bps === 0 ? t("rateLimit.unlimited") : formatRateLimit(bps)}</option>
+            ))}
           </Select>
         </div>
       </div>
       <div className="min-h-0">
         <Label>{t("properties.progressMap")}</Label>
-        <ProgressMap parts={item.parts} connections={conns ?? item.connections} />
+        <ProgressMap parts={item.parts} connections={connValue} status={item.status} />
       </div>
       <div>
         <Label>{t("properties.url")}</Label>

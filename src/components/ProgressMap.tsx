@@ -1,4 +1,4 @@
-import type { DownloadPart } from "../types";
+import type { DownloadPart, DownloadStatus } from "../types";
 import { t } from "../i18n";
 
 const ROW_H = 28;
@@ -10,8 +10,16 @@ export interface ThreadBar {
 }
 
 /** One bar per connection, folding parts onto connection slots. */
-export function threadBars(parts: DownloadPart[], connections: number): ThreadBar[] {
+export function threadBars(
+  parts: DownloadPart[],
+  connections: number,
+  status?: DownloadStatus,
+): ThreadBar[] {
+  if (connections <= 0 && parts.length === 0) return [];
   const n = Math.max(1, connections || parts.length || 1);
+  if (status === "completed") {
+    return Array.from({ length: n }, (_, i) => ({ index: i + 1, percent: 100 }));
+  }
   const buckets = Array.from({ length: n }, () => ({ downloaded: 0, size: 0 }));
   if (parts.length === 0) {
     return buckets.map((_, i) => ({ index: i + 1, percent: 0 }));
@@ -30,10 +38,11 @@ export function threadBars(parts: DownloadPart[], connections: number): ThreadBa
 interface ThreadBarsProps {
   parts: DownloadPart[];
   connections: number;
+  status?: DownloadStatus;
 }
 
-export default function ProgressMap({ parts, connections }: ThreadBarsProps) {
-  const bars = threadBars(parts, connections);
+export default function ProgressMap({ parts, connections, status }: ThreadBarsProps) {
+  const bars = threadBars(parts, connections, status);
   if (!bars.length) {
     return <div className="text-[13px] text-muted-foreground">{t("properties.progressMapEmpty")}</div>;
   }

@@ -135,4 +135,10 @@ describe("threadBars", () => {
   it("returns empty bars when there are no parts yet", () => {
     expect(threadBars([], 4).map((b) => b.percent)).toEqual([0, 0, 0, 0]);
   });
+
+  it("shows nothing for Auto with no parts, and 100% once completed", () => {
+    expect(threadBars([], 0)).toEqual([]);
+    expect(threadBars([], 4, "completed").map((b) => b.percent)).toEqual([100, 100, 100, 100]);
+    expect(threadBars([part(0, 0, 100, 40)], 0, "completed")[0]!.percent).toBe(100);
+  });
 });

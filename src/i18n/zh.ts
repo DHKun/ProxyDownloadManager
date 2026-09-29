@@ -52,6 +52,10 @@ const zh: Translations = {
     retrying: "重试中",
     merging: "合并中",
     failed: "失败",
+    downloading: "下载中",
+    paused: "已暂停",
+    completed: "已完成",
+    queued: "排队中",
   },
   downloadTable: {
     loading: "加载中...",

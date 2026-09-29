@@ -50,6 +50,10 @@ const en = {
     retrying: "Retrying",
     merging: "Merging",
     failed: "Failed",
+    downloading: "Downloading",
+    paused: "Paused",
+    completed: "Completed",
+    queued: "Queued",
   },
   downloadTable: {
     loading: "Loading...",
