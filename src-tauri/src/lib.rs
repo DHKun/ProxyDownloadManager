@@ -4,9 +4,9 @@ mod download_manager;
 mod engine;
 mod event_bus;
 mod event_handler;
+mod file_icon;
 mod filename;
 mod headers;
-mod icons;
 mod logger;
 mod network;
 mod platform;
@@ -193,8 +193,17 @@ pub fn run() {
 
             let _ = crate::tray::build_tray(app.handle(), &settings.global_shortcut);
 
-            let icon_cache = crate::icons::IconCache::new();
-            app.manage(icon_cache);
+            let icon_root = app
+                .path()
+                .app_data_dir()
+                .unwrap_or_else(|_| {
+                    crate::state::gob::state_dir()
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| std::path::PathBuf::from("."))
+                })
+                .join("icon-cache-v1");
+            app.manage(crate::file_icon::FileIconService::new(icon_root));
 
             let danger_accept_invalid_certs = settings.danger_accept_invalid_certs;
             let next_id_start = db.max_id().unwrap_or(0) + 1;
@@ -290,6 +299,7 @@ pub fn run() {
             cmd::file_exists,
             cmd::test_proxy,
             cmd::get_file_icon,
+            cmd::get_file_icons,
             cmd::open_extensions_folder,
             cmd::get_extensions_dir,
             update::check_update,

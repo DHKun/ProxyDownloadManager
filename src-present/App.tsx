@@ -236,7 +236,7 @@ function Page() {
               <li>
                 <span className="site-mono text-[12px] text-[#737373]">03</span>
                 <div className="font-medium">详情窗一屏看完。</div>
-                <div className="text-[#737373]">横向小窗里是状态、速度、代理和一条连接进度，底部直接改代理、连接数和限速。</div>
+                <div className="text-[#737373]">横向小窗里是状态、速度、代理和一条连接进度，右侧是文件图标，底部直接改代理、连接数和限速。</div>
               </li>
             </ol>
           </div>

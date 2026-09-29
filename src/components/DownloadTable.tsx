@@ -2,7 +2,7 @@ import { memo, useCallback, useRef } from "react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { useDownloads } from "../query/downloadQueries";
 import { useDownloadSpeed } from "../hooks/useDownloadSpeed";
-import { useFileIcons, iconFor } from "../hooks/useFileIcons";
+import FileIcon from "./FileIcon";
 import { t } from "../i18n";
 import { applyFilter, openFile, openFolder } from "../utils/download";
 import { useAppContext } from "../contexts/AppContext";
@@ -59,7 +59,6 @@ export default function DownloadTable({ filter, query = "", typeFilter = "all" }
   const { data: downloads = [], isLoading } = useDownloads();
   const filtered = applyFilter(downloads, filter, query, typeFilter);
   const speeds = useDownloadSpeed(filtered);
-  const icons = useFileIcons(filtered);
   const { menuState, menuRef, handleContext, closeMenu } = useContextMenu();
   const anchor = useRef<number | null>(null);
 
@@ -131,7 +130,6 @@ export default function DownloadTable({ filter, query = "", typeFilter = "all" }
               key={row.id}
               item={row}
               selected={selectedIds.has(row.id)}
-              icon={iconFor(icons, row.file_name)}
               speed={speeds.get(row.id)?.display ?? "—"}
               bps={speeds.get(row.id)?.bps ?? 0}
               onToggle={() => selectionActions.toggle(row.id)}
@@ -209,11 +207,10 @@ function RowMenu({
 }
 
 const DownloadRow = memo(function DownloadRow({
-  item, selected, icon, speed, bps, onToggle, onClick, onContext, onDoubleClick,
+  item, selected, speed, bps, onToggle, onClick, onContext, onDoubleClick,
 }: {
   item: DownloadItem;
   selected: boolean;
-  icon: string;
   speed: string;
   bps: number;
   onToggle: () => void;
@@ -242,8 +239,15 @@ const DownloadRow = memo(function DownloadRow({
         <Checkbox checked={selected} onCheckedChange={onToggle} />
       </td>
       <td className="max-w-0 px-2 py-1">
-        <div className="flex min-w-0 items-center gap-1.5">
-          <img src={icon} alt="" width={16} height={16} className="shrink-0" />
+        <div className="flex min-w-0 items-center gap-2">
+          <FileIcon
+            id={item.id}
+            fileName={item.file_name}
+            path={item.save_path}
+            mimeType={item.content_type}
+            completed={item.status === "completed"}
+            size={18}
+          />
           <span className="truncate font-medium">{item.file_name}</span>
         </div>
       </td>

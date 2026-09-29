@@ -1,10 +1,17 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { DownloadItem, ProbeInfo, Settings, UpdateInfo } from "./types";
 
-interface IconData {
-  rgba: string;
-  width: number;
-  height: number;
+export interface FileIconRequest {
+  id: number;
+  fileName: string;
+  path: string;
+  mimeType: string;
+  completed: boolean;
+}
+
+export interface FileIconBatch {
+  icons: { key: string; mime_type: string; data: string }[];
+  matches: { id: number; key: string }[];
 }
 
 interface ProxyTestResult {
@@ -68,7 +75,8 @@ export const tauriClient = {
   readLogs: (maxLines: number = 50) => invoke<string[]>("read_logs", { maxLines }),
   getExtensionsDir: () => invoke<string>("get_extensions_dir"),
   openExtensionsFolder: () => invoke<void>("open_extensions_folder"),
-  getFileIcon: (fileName: string) => invoke<IconData>("get_file_icon", { fileName }),
+  getFileIcons: (requests: FileIconRequest[]) =>
+    invoke<FileIconBatch>("get_file_icons", { requests }),
   checkUpdate: (proxyName: string) => invoke<UpdateInfo>("check_update", { proxyName }),
   testProxy: (proxyName: string) => invoke<ProxyTestResult>("test_proxy", { proxyName }),
 };

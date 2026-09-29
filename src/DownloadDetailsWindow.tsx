@@ -11,6 +11,7 @@ import { Button } from "./components/ui/button";
 import { Progress } from "./components/ui/progress";
 import { Select } from "./components/ui/select";
 import { tauriClient } from "./tauriClient";
+import FileIcon from "./components/FileIcon";
 import type { DownloadItem } from "./types";
 
 const CONN_OPTIONS = [0, 1, 4, 8, 16, 32, 64];
@@ -233,7 +234,8 @@ export default function DownloadDetailsWindow() {
           </Button>
         </div>
 
-        <div className="grid grid-cols-3 gap-x-3 gap-y-1">
+        <div className="flex min-w-0 items-center gap-2">
+        <div className="grid min-w-0 flex-1 grid-cols-3 gap-x-3 gap-y-1">
           <Field label={t("properties.status")} value={statusText} title={statusTitle} valueClass={failed ? "text-destructive" : ""} />
           <Field label={t("properties.size")} value={sizeText} />
           <Field label={t("properties.remain")} value={active && speed ? computeETA(item, speed.bps) : "—"} />
@@ -243,6 +245,15 @@ export default function DownloadDetailsWindow() {
           <Field label={t("properties.proxy")} value={proxyValue || t("newDownload.noProxy")} />
           <Field label={t("properties.conn")} value={connLabel} />
           <Field label={t("properties.speedLimit")} value={rateText(rateBps)} />
+        </div>
+          <FileIcon
+            id={item.id}
+            fileName={item.file_name}
+            path={item.save_path}
+            mimeType={item.content_type}
+            completed={completed}
+            size={52}
+          />
         </div>
 
         <div className="flex items-center gap-2">

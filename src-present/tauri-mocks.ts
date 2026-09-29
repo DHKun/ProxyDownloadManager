@@ -157,6 +157,140 @@ function emit(event: string, payload?: unknown) {
   if (set) set.forEach((fn) => fn({ payload, event }));
 }
 
+/** Same categories as the app fallback, drawn as SVG so the demo matches the list and details icons. */
+function showcaseIcon(body: string): string {
+  return (
+    "data:image/svg+xml;utf8," +
+    encodeURIComponent(
+      `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#a3a3a3" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round">${body}</svg>`,
+    )
+  );
+}
+
+const PAGE =
+  `<path d="M7 3.5h7.2L18 7.2V20a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 6 20V5A1.5 1.5 0 0 1 7 3.5Z"/>` +
+  `<path d="M14 3.8V7.5h3.6"/>`;
+
+const SHOWCASE_ICONS: Record<string, string> = {
+  generic: showcaseIcon(PAGE),
+  document: showcaseIcon(`${PAGE}<path d="M9 11.5h6M9 14.5h5.2M9 17.5h4"/>`),
+  pdf: showcaseIcon(`${PAGE}<path d="M8.6 12h6.8v4.4H8.6z"/>`),
+  executable: showcaseIcon(`<rect x="5" y="5" width="14" height="14" rx="1.5"/><path d="M9.2 12h5.2M12 9.4l2.6 2.6L12 14.6"/>`),
+  archive: showcaseIcon(
+    `<path d="M5.5 9.2h13v9.3a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1V9.2Z"/>` +
+      `<path d="M9 9.2V7.4A1 1 0 0 1 10 6.4h4a1 1 0 0 1 1 1v1.8"/>` +
+      `<path d="M11.2 12.2h1.6M11.2 14.6h1.6M11.2 17h1.6"/>`,
+  ),
+  video: showcaseIcon(`<rect x="4.5" y="6.5" width="15" height="11" rx="1.5"/><path d="M10.6 9.4v5.2l4.2-2.6z" fill="#a3a3a3" stroke="none"/>`),
+  audio: showcaseIcon(`<path d="M8 10.5v3h2.2l3 2.4V8.1l-3 2.4H8Z"/><path d="M15.2 10.2a2.4 2.4 0 0 1 0 3.6"/>`),
+  image: showcaseIcon(`<rect x="4.5" y="5.5" width="15" height="13" rx="1.5"/><circle cx="9" cy="10" r="1.2"/><path d="M6.6 16.2 10 12.8l2.4 2.2 2.2-2 3.2 3.2"/>`),
+  installer: showcaseIcon(`${PAGE}<path d="M12 11v6M9.4 14.6 12 17.2l2.6-2.6"/>`),
+  disk: showcaseIcon(`<circle cx="12" cy="12" r="7.2"/><circle cx="12" cy="12" r="2.2"/>`),
+};
+
+function showcaseCategory(fileName: string, mimeType: string): string {
+  const base = (fileName.split(/[/\\]/).pop() ?? fileName).trim();
+  const dot = base.lastIndexOf(".");
+  const ext = dot > 0 ? base.slice(dot + 1).toLowerCase() : "";
+  switch (ext) {
+    case "exe":
+    case "msi":
+    case "bat":
+    case "cmd":
+    case "com":
+    case "appimage":
+    case "bin":
+      return "executable";
+    case "deb":
+    case "rpm":
+    case "pkg":
+    case "apk":
+      return "installer";
+    case "dmg":
+    case "iso":
+    case "img":
+      return "disk";
+    case "zip":
+    case "7z":
+    case "rar":
+    case "tar":
+    case "gz":
+    case "tgz":
+    case "bz2":
+    case "xz":
+    case "zst":
+      return "archive";
+    case "mp4":
+    case "mkv":
+    case "webm":
+    case "avi":
+    case "mov":
+    case "m4v":
+    case "flv":
+    case "wmv":
+      return "video";
+    case "mp3":
+    case "flac":
+    case "wav":
+    case "ogg":
+    case "aac":
+    case "m4a":
+    case "opus":
+      return "audio";
+    case "png":
+    case "jpg":
+    case "jpeg":
+    case "gif":
+    case "webp":
+    case "bmp":
+    case "svg":
+    case "ico":
+    case "heic":
+      return "image";
+    case "pdf":
+      return "pdf";
+    case "txt":
+    case "md":
+    case "log":
+    case "doc":
+    case "docx":
+    case "odt":
+    case "rtf":
+    case "xls":
+    case "xlsx":
+    case "csv":
+    case "ppt":
+    case "pptx":
+      return "document";
+    default:
+      break;
+  }
+  const mime = mimeType.toLowerCase();
+  if (mime.startsWith("video/")) return "video";
+  if (mime.startsWith("audio/")) return "audio";
+  if (mime.startsWith("image/")) return "image";
+  if (mime.includes("pdf")) return "pdf";
+  if (mime.includes("zip") || mime.includes("archive") || mime.includes("compressed")) return "archive";
+  if (mime.includes("executable") || mime.includes("x-msdos")) return "executable";
+  if (mime.startsWith("text/") || mime.includes("document") || mime.includes("word")) return "document";
+  return "generic";
+}
+
+function showcaseIconBatch(requests: { id?: number; fileName?: string; mimeType?: string }[]) {
+  const icons: { key: string; mime_type: string; data: string }[] = [];
+  const seen = new Set<string>();
+  const matches = requests.map((req) => {
+    const category = showcaseCategory(req.fileName ?? "", req.mimeType ?? "");
+    const key = `present:${category}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      icons.push({ key, mime_type: "image/svg+xml", data: SHOWCASE_ICONS[category] });
+    }
+    return { id: req.id ?? 0, key };
+  });
+  return { icons, matches };
+}
+
 async function invoke(command: string, args?: Record<string, any>): Promise<any> {
   await new Promise((r) => setTimeout(r, 12));
 
@@ -268,8 +402,12 @@ async function invoke(command: string, args?: Record<string, any>): Promise<any>
       return "~/Library/Application Support/com.fb0sh.proxydownloadmanager/extensions";
     case "open_extensions_folder":
       return;
-    case "get_file_icon":
-      return { rgba: "", width: 32, height: 32 };
+    case "get_file_icon": {
+      const batch = showcaseIconBatch(args?.request ? [args.request] : []);
+      return batch.icons[0] ?? { key: "present:generic", mime_type: "image/svg+xml", data: SHOWCASE_ICONS.generic };
+    }
+    case "get_file_icons":
+      return showcaseIconBatch(Array.isArray(args?.requests) ? args.requests : []);
     case "exit_app":
       return;
     default:

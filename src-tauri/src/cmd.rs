@@ -1,6 +1,6 @@
 use crate::download_manager::DownloadManager;
 use crate::event_bus::EventBus;
-use crate::icons::{IconCache, IconData};
+use crate::file_icon::{FileIconService, IconBatch, IconPayload, IconRequest};
 use crate::services::network_service::NetworkService;
 use crate::services::settings_service::SettingsService;
 use crate::state::ledger::ProgressLedger;
@@ -223,8 +223,13 @@ pub fn file_exists(path: String) -> bool {
 }
 
 #[tauri::command]
-pub fn get_file_icon(icon_cache: State<'_, IconCache>, file_name: String) -> IconData {
-    icon_cache.get(&file_name)
+pub fn get_file_icon(icons: State<'_, FileIconService>, request: IconRequest) -> IconPayload {
+    icons.get_one(request)
+}
+
+#[tauri::command]
+pub fn get_file_icons(icons: State<'_, FileIconService>, requests: Vec<IconRequest>) -> IconBatch {
+    icons.get_many(requests)
 }
 
 #[tauri::command]
