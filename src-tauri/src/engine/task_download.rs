@@ -7,6 +7,13 @@ use crate::types::Task;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// How long a chunk may sit with no body bytes before it is stalled.
+/// Limiter waits happen outside this timer.
+pub const BODY_IDLE: Duration = Duration::from_secs(30);
+const WRITE_BUFFER: usize = 256 * 1024;
+const PROGRESS_FLUSH: Duration = Duration::from_millis(250);
 
 /// Outcome of a single chunk download attempt.
 #[derive(Debug, PartialEq)]
@@ -29,6 +36,23 @@ pub enum TaskResult {
     FatalNoRetry(String),
 }
 
+fn flush_progress(
+    file: &std::fs::File,
+    buf: &mut Vec<u8>,
+    bytes_written: &AtomicU64,
+    parts: Option<&PartProgressTracker>,
+    at: u64,
+) -> Result<u64, String> {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    write_at(file, buf, at).map_err(|e| e.to_string())?;
+    let n = buf.len() as u64;
+    note_write(bytes_written, parts, at, n);
+    buf.clear();
+    Ok(n)
+}
+
 fn note_write(
     bytes_written: &AtomicU64,
     parts: Option<&PartProgressTracker>,
@@ -38,7 +62,10 @@ fn note_write(
     if len == 0 {
         return;
     }
-    bytes_written.fetch_add(len, Ordering::Relaxed);
+    let prev = bytes_written.fetch_add(len, Ordering::Relaxed);
+    if prev == 0 {
+        log::debug!("[startup] first-progress-byte");
+    }
     if let Some(p) = parts {
         p.record_write(file_offset, len);
     }
@@ -155,6 +182,7 @@ pub async fn download_task(
     parts: Option<Arc<PartProgressTracker>>,
     headers: &HashMap<String, String>,
     expected_total: u64,
+    idle: Duration,
 ) -> TaskResult {
     let mut written: u64 = 0;
     let range_end = if task.length == 0 {
@@ -300,24 +328,21 @@ pub async fn download_task(
     let base_offset = task.offset;
     let chunk_size = task.length;
 
-    const BUF_SIZE: usize = 1024 * 1024; // 1MB
-    let mut buf = Vec::with_capacity(BUF_SIZE);
-
-    // Slow chunk detection: if >30s elapsed and <10% done, abort
-    let start_time = std::time::Instant::now();
+    let mut buf = Vec::with_capacity(WRITE_BUFFER);
+    let mut last_flush = Instant::now();
+    let mut last_byte = Instant::now();
 
     loop {
-        // Check cancel (responsive Stop even during streaming)
         if cancel.load(Ordering::Relaxed) {
-            // Flush buffered data before returning to avoid data loss
-            if !buf.is_empty() {
-                if let Err(e) = write_at(file, &buf, base_offset + written) {
-                    return TaskResult::Fatal(format!("write_at error on cancel: {}", e));
-                }
-                let n = buf.len() as u64;
-                note_write(bytes_written, parts.as_deref(), base_offset + written, n);
-                written += n;
-                buf.clear();
+            match flush_progress(
+                file,
+                &mut buf,
+                bytes_written,
+                parts.as_deref(),
+                base_offset + written,
+            ) {
+                Ok(n) => written += n,
+                Err(e) => return TaskResult::Fatal(format!("write_at error on cancel: {e}")),
             }
             let remaining = chunk_size.saturating_sub(written);
             if remaining > 0 {
@@ -331,56 +356,42 @@ pub async fn download_task(
             return TaskResult::Cancelled;
         }
 
-        // Abort slow chunks so other workers can steal remaining work.
-        // Flush first: bytes sitting in `buf` are real progress and must not
-        // be dropped when the remainder is re-queued.
-        let elapsed = start_time.elapsed();
-        let pending = written + buf.len() as u64;
-        if elapsed > std::time::Duration::from_secs(30)
-            && chunk_size > 0
-            && pending < chunk_size / 10
-        {
-            if !buf.is_empty() {
-                if let Err(e) = write_at(file, &buf, base_offset + written) {
-                    return TaskResult::Fatal(format!("write_at error: {}", e));
+        // Flush while the next read is still blocked, so a small chunk is
+        // visible within PROGRESS_FLUSH instead of sitting until the next packet.
+        let idle_left = idle.saturating_sub(last_byte.elapsed());
+        let flush_left = if buf.is_empty() {
+            None
+        } else {
+            Some(PROGRESS_FLUSH.saturating_sub(last_flush.elapsed()))
+        };
+        let chunk_result = if let Some(flush_left) = flush_left {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep(flush_left) => {
+                    match flush_progress(file, &mut buf, bytes_written, parts.as_deref(), base_offset + written) {
+                        Ok(n) => written += n,
+                        Err(e) => return TaskResult::Fatal(format!("write_at error: {e}")),
+                    }
+                    last_flush = Instant::now();
+                    continue;
                 }
-                let n = buf.len() as u64;
-                note_write(bytes_written, parts.as_deref(), base_offset + written, n);
-                written += n;
-                buf.clear();
+                result = tokio::time::timeout(idle_left, stream.next()) => result,
             }
-            log::debug!(
-                "[ProxyDM] slow chunk offset={} written={}/{} after {}s, re-queuing",
-                base_offset,
-                written,
-                chunk_size,
-                elapsed.as_secs()
-            );
-            let remaining = chunk_size.saturating_sub(written);
-            if remaining == 0 {
-                return TaskResult::Complete;
-            }
-            return TaskResult::Partial {
-                remaining: Task {
-                    offset: base_offset + written,
-                    length: remaining,
-                },
-            };
-        }
-
-        let chunk_result =
-            tokio::time::timeout(std::time::Duration::from_secs(10), stream.next()).await;
+        } else {
+            tokio::time::timeout(idle_left, stream.next()).await
+        };
         let chunk = match chunk_result {
             Ok(Some(Ok(c))) => c,
             Ok(Some(Err(e))) => {
-                if !buf.is_empty() {
-                    if let Err(err) = write_at(file, &buf, base_offset + written) {
-                        return TaskResult::Fatal(format!("write_at error: {}", err));
-                    }
-                    let n = buf.len() as u64;
-                    note_write(bytes_written, parts.as_deref(), base_offset + written, n);
-                    written += n;
-                    buf.clear();
+                match flush_progress(
+                    file,
+                    &mut buf,
+                    bytes_written,
+                    parts.as_deref(),
+                    base_offset + written,
+                ) {
+                    Ok(n) => written += n,
+                    Err(err) => return TaskResult::Fatal(format!("write_at error: {err}")),
                 }
                 let remaining = chunk_size.saturating_sub(written);
                 if remaining == 0 {
@@ -394,31 +405,33 @@ pub async fn download_task(
                         },
                     };
                 }
-                return TaskResult::Fatal(format!("Stream error: {}", e));
+                return TaskResult::Fatal(format!("Stream error: {e}"));
             }
             Ok(None) => {
-                if !buf.is_empty() {
-                    if let Err(e) = write_at(file, &buf, base_offset + written) {
-                        return TaskResult::Fatal(format!("write_at error: {}", e));
-                    }
-                    let n = buf.len() as u64;
-                    note_write(bytes_written, parts.as_deref(), base_offset + written, n);
-                    written += n;
+                match flush_progress(
+                    file,
+                    &mut buf,
+                    bytes_written,
+                    parts.as_deref(),
+                    base_offset + written,
+                ) {
+                    Ok(n) => written += n,
+                    Err(e) => return TaskResult::Fatal(format!("write_at error: {e}")),
                 }
                 break;
             }
-            Err(_elapsed) => {
+            Err(_) => {
+                match flush_progress(
+                    file,
+                    &mut buf,
+                    bytes_written,
+                    parts.as_deref(),
+                    base_offset + written,
+                ) {
+                    Ok(n) => written += n,
+                    Err(e) => return TaskResult::Fatal(format!("write_at error: {e}")),
+                }
                 if cancel.load(Ordering::Relaxed) {
-                    // Flush buffered data before returning
-                    if !buf.is_empty() {
-                        if let Err(e) = write_at(file, &buf, base_offset + written) {
-                            return TaskResult::Fatal(format!("write_at error on cancel: {}", e));
-                        }
-                        let n = buf.len() as u64;
-                        note_write(bytes_written, parts.as_deref(), base_offset + written, n);
-                        written += n;
-                        buf.clear();
-                    }
                     let remaining = chunk_size.saturating_sub(written);
                     if remaining > 0 {
                         return TaskResult::Partial {
@@ -430,10 +443,30 @@ pub async fn download_task(
                     }
                     return TaskResult::Cancelled;
                 }
-                continue;
+                log::debug!(
+                    "[ProxyDM] body idle offset={} written={} for {}s",
+                    base_offset,
+                    written,
+                    idle.as_secs()
+                );
+                let remaining = chunk_size.saturating_sub(written);
+                if remaining == 0 {
+                    return TaskResult::Complete;
+                }
+                return TaskResult::Partial {
+                    remaining: Task {
+                        offset: base_offset + written,
+                        length: remaining,
+                    },
+                };
             }
         };
+        if chunk.is_empty() {
+            continue;
+        }
         limiter.wait_n(chunk.len() as u64).await;
+        // Idle starts after throttling. A user limit must not look like a stall.
+        last_byte = Instant::now();
 
         buf.extend_from_slice(&chunk);
 
@@ -450,12 +483,16 @@ pub async fn download_task(
         };
         if cap > 0 && written + buf.len() as u64 >= cap {
             buf.truncate((cap - written) as usize);
-            if let Err(e) = write_at(file, &buf, base_offset + written) {
-                return TaskResult::Fatal(format!("write_at error: {}", e));
+            match flush_progress(
+                file,
+                &mut buf,
+                bytes_written,
+                parts.as_deref(),
+                base_offset + written,
+            ) {
+                Ok(n) => written += n,
+                Err(e) => return TaskResult::Fatal(format!("write_at error: {e}")),
             }
-            let n = buf.len() as u64;
-            note_write(bytes_written, parts.as_deref(), base_offset + written, n);
-            written += n;
             if chunk_size > written {
                 return TaskResult::Partial {
                     remaining: Task {
@@ -467,14 +504,18 @@ pub async fn download_task(
             return TaskResult::Complete;
         }
 
-        if buf.len() >= BUF_SIZE {
-            if let Err(e) = write_at(file, &buf, base_offset + written) {
-                return TaskResult::Fatal(format!("write_at error: {}", e));
+        if buf.len() >= WRITE_BUFFER {
+            match flush_progress(
+                file,
+                &mut buf,
+                bytes_written,
+                parts.as_deref(),
+                base_offset + written,
+            ) {
+                Ok(n) => written += n,
+                Err(e) => return TaskResult::Fatal(format!("write_at error: {e}")),
             }
-            let n = buf.len() as u64;
-            note_write(bytes_written, parts.as_deref(), base_offset + written, n);
-            written += n;
-            buf.clear();
+            last_flush = Instant::now();
         }
     }
 
@@ -554,5 +595,262 @@ mod tests {
         } else {
             panic!("expected Fatal");
         }
+    }
+
+    #[test]
+    fn body_idle_is_thirty_seconds() {
+        assert_eq!(BODY_IDLE, Duration::from_secs(30));
+    }
+
+    fn requested_range(req: &str) -> Option<(u64, u64)> {
+        for line in req.lines() {
+            let line = line.trim();
+            if line.len() < 6 || !line[..6].eq_ignore_ascii_case("range:") {
+                continue;
+            }
+            let spec = line[6..].trim().strip_prefix("bytes=")?;
+            let (start, end) = spec.split_once('-')?;
+            return Some((start.trim().parse().ok()?, end.trim().parse().ok()?));
+        }
+        None
+    }
+
+    async fn read_http(stream: &mut tokio::net::TcpStream) -> Option<String> {
+        use tokio::io::AsyncReadExt;
+        let mut total = Vec::new();
+        let mut buf = [0u8; 2048];
+        loop {
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            if n == 0 {
+                return None;
+            }
+            total.extend_from_slice(&buf[..n]);
+            if total.windows(4).any(|w| w == b"\r\n\r\n") || total.len() > 8192 {
+                break;
+            }
+        }
+        Some(String::from_utf8_lossy(&total).into_owned())
+    }
+
+    enum Pace {
+        /// One byte at a time, faster than the idle window.
+        Trickle,
+        /// A few bytes, then silence while the socket stays open.
+        Stall,
+        /// A first slice, a pause, then the rest. The pause is long enough
+        /// for the client to read the slice and enter the limiter.
+        Split { first: usize, gap: Duration },
+    }
+
+    async fn pace_server(total: u64, pace: Pace) -> String {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Some(req) = read_http(&mut stream).await else {
+                return;
+            };
+            let Some((start, end)) = requested_range(&req) else {
+                return;
+            };
+            let len = (end - start + 1) as usize;
+            let hdr = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
+            );
+            if stream.write_all(hdr.as_bytes()).await.is_err() {
+                return;
+            }
+            let body = vec![7u8; len];
+            match pace {
+                Pace::Trickle => {
+                    for byte in &body {
+                        if stream.write_all(&[*byte]).await.is_err() {
+                            return;
+                        }
+                        let _ = stream.flush().await;
+                        tokio::time::sleep(Duration::from_millis(40)).await;
+                    }
+                }
+                Pace::Stall => {
+                    let n = 128.min(body.len());
+                    let _ = stream.write_all(&body[..n]).await;
+                    let _ = stream.flush().await;
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    return;
+                }
+                Pace::Split { first, gap } => {
+                    let first = first.min(body.len());
+                    let _ = stream.write_all(&body[..first]).await;
+                    let _ = stream.flush().await;
+                    tokio::time::sleep(gap).await;
+                    let _ = stream.write_all(&body[first..]).await;
+                }
+            }
+            let _ = stream.shutdown().await;
+        });
+        format!("http://127.0.0.1:{port}/file.bin")
+    }
+
+    fn temp_bin(prefix: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        std::env::temp_dir().join(format!(
+            "{prefix}_{}_{}.bin",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    async fn run_one(url: &str, len: u64, idle: Duration, bps: u64) -> (TaskResult, u64, Duration) {
+        let client = reqwest::Client::builder().build().unwrap();
+        let path = temp_bin("pdm_idle");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .unwrap();
+        let bytes = Arc::new(AtomicU64::new(0));
+        let limiter = MultiLimiter::new(bps, 0);
+        let cancel = AtomicBool::new(false);
+        let started = Instant::now();
+        let result = download_task(
+            url,
+            &client,
+            &file,
+            &Task {
+                offset: 0,
+                length: len,
+            },
+            &cancel,
+            &limiter,
+            "pdm-test",
+            &bytes,
+            None,
+            &HashMap::new(),
+            len,
+            idle,
+        )
+        .await;
+        let n = bytes.load(Ordering::Relaxed);
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        (result, n, started.elapsed())
+    }
+
+    #[tokio::test]
+    async fn slow_but_continuous_body_is_not_a_stall() {
+        let total = 25u64;
+        let url = pace_server(total, Pace::Trickle).await;
+        let (result, n, elapsed) = run_one(&url, total, Duration::from_millis(300), 0).await;
+        assert_eq!(result, TaskResult::Complete, "{elapsed:?}");
+        assert_eq!(n, total);
+    }
+
+    #[tokio::test]
+    async fn silent_body_is_a_stall() {
+        let total = 4096u64;
+        let url = pace_server(total, Pace::Stall).await;
+        let (result, n, elapsed) = run_one(&url, total, Duration::from_millis(400), 0).await;
+        assert!(
+            matches!(result, TaskResult::Partial { .. }),
+            "{result:?} after {elapsed:?}"
+        );
+        assert!(n > 0, "stall flushed no bytes");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "idle waited {elapsed:?} instead of ~400ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn limiter_wait_is_not_a_body_stall() {
+        let total = 16 * 1024u64;
+        let url = pace_server(
+            total,
+            Pace::Split {
+                first: 8 * 1024,
+                gap: Duration::from_millis(400),
+            },
+        )
+        .await;
+        // 8 KiB at 8 KiB/s waits about a second, longer than the 250ms idle.
+        let (result, n, elapsed) = run_one(&url, total, Duration::from_millis(250), 8 * 1024).await;
+        assert_eq!(
+            result,
+            TaskResult::Complete,
+            "throttled read looked like a stall after {elapsed:?}, bytes={n}"
+        );
+        assert_eq!(n, total);
+        assert!(
+            elapsed > Duration::from_millis(600),
+            "limiter did not wait: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_is_visible_before_a_one_megabyte_buffer() {
+        let total = 64 * 1024u64;
+        let url = pace_server(
+            total,
+            Pace::Split {
+                first: 4096,
+                gap: Duration::from_millis(800),
+            },
+        )
+        .await;
+        let client = reqwest::Client::builder().build().unwrap();
+        let path = temp_bin("pdm_flush");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .unwrap();
+        let bytes = Arc::new(AtomicU64::new(0));
+        let watch = bytes.clone();
+        let url2 = url.clone();
+        let handle = tokio::spawn(async move {
+            let limiter = MultiLimiter::new(0, 0);
+            let cancel = AtomicBool::new(false);
+            download_task(
+                &url2,
+                &client,
+                &file,
+                &Task {
+                    offset: 0,
+                    length: total,
+                },
+                &cancel,
+                &limiter,
+                "pdm-test",
+                &bytes,
+                None,
+                &HashMap::new(),
+                total,
+                Duration::from_secs(5),
+            )
+            .await
+        });
+        let started = Instant::now();
+        let mut seen = 0u64;
+        while started.elapsed() < Duration::from_millis(600) {
+            seen = watch.load(Ordering::Relaxed);
+            if seen > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(seen > 0, "no bytes flushed within 600ms");
+        assert!(
+            seen < total,
+            "full file was buffered before any progress: {seen}"
+        );
+        let result = handle.await.unwrap();
+        assert_eq!(result, TaskResult::Complete);
+        let _ = std::fs::remove_file(&path);
     }
 }

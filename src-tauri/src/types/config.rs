@@ -48,6 +48,8 @@ pub struct Settings {
     #[serde(default = "default_silent_startup")]
     pub silent_startup: bool,
     pub proxies: std::collections::HashMap<String, ProxyConfig>,
+    /// Bytes per second. `0` is unlimited. Missing in an older file means unlimited.
+    #[serde(default)]
     pub global_rate_limit: u64,
     pub default_proxy: String,
     pub home_dir: String,
@@ -74,7 +76,9 @@ impl Default for Settings {
                 .unwrap_or_else(|| home.clone())
                 .to_string_lossy()
                 .to_string(),
-            max_connections: 0, // 0 = auto
+            // 0 = Auto (pick by file size). Any other value is the default
+            // thread count for a new download that did not choose one.
+            max_connections: 0,
             max_retries: 10,
             user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0".to_string(),
             launch_at_startup: false,
@@ -109,6 +113,7 @@ mod tests {
     fn test_settings_default() {
         let s = Settings::default();
         assert_eq!(s.max_connections, 0); // default is auto
+        assert_eq!(s.global_rate_limit, 0);
         assert!(s.max_retries > 0);
         assert!(!s.download_dir.is_empty());
         assert_eq!(s.file_conflict, FileConflictPolicy::Rename);

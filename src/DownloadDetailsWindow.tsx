@@ -40,9 +40,7 @@ function autoConnectionCount(fileSize: number): number {
   if (fileSize <= 0) return 2;
   if (fileSize < 2 * mib) return 1;
   if (fileSize < 16 * mib) return 4;
-  if (fileSize < 128 * mib) return 8;
-  if (fileSize < 1024 * mib) return 16;
-  return 32;
+  return 8;
 }
 
 function liveConnectionCount(item: DownloadItem): number {
@@ -172,6 +170,10 @@ export default function DownloadDetailsWindow() {
     : [proxyValue, ...proxyNames];
   const connOptions = withCurrent(CONN_OPTIONS, connValue);
   const rateBps = Number(rateValue) || 0;
+  const globalBps = loadedSettings?.global_rate_limit ?? 0;
+  const rateTitle = rateBps === 0 && globalBps > 0
+    ? t("rateLimit.taskUnlimitedUnderGlobal").replace("{rate}", formatRateLimit(globalBps))
+    : undefined;
   const rateOptions = withCurrent(withCurrent(RATE_OPTIONS, rateBps), item.rate_limit_bps || 0);
   const sizeText = segments
     ? (item.total_size > 0
@@ -298,7 +300,7 @@ export default function DownloadDetailsWindow() {
           <Field label={t("properties.resumeShort")} value={resumeText} />
           <Field label={t("properties.proxy")} value={proxyValue || t("newDownload.noProxy")} />
           <Field label={t("properties.conn")} value={connLabel} />
-          <Field label={t("properties.speedLimit")} value={rateText(rateBps)} />
+          <Field label={t("properties.speedLimit")} value={rateText(rateBps)} title={rateTitle} />
         </div>
           <FileIcon
             id={item.id}
@@ -368,7 +370,7 @@ export default function DownloadDetailsWindow() {
                 </option>
               ))}
             </Select>
-            <Select className="h-7 w-auto min-w-0 flex-1 px-1.5 text-[12px] disabled:opacity-50" value={String(rateBps)} disabled={!caps.rateLimit || controlBusy !== null} onChange={(e) => { void applyRate(e.target.value); }}>
+            <Select className="h-7 w-auto min-w-0 flex-1 px-1.5 text-[12px] disabled:opacity-50" value={String(rateBps)} disabled={!caps.rateLimit || controlBusy !== null} title={rateTitle} onChange={(e) => { void applyRate(e.target.value); }}>
               {rateOptions.map((bps) => (
                 <option key={bps} value={bps}>{rateText(bps)}</option>
               ))}

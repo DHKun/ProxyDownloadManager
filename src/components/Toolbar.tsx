@@ -3,6 +3,7 @@ import { t } from "../i18n";
 import { useAppContext } from "../contexts/AppContext";
 import { Button } from "./ui/button";
 import { Select } from "./ui/select";
+import { useQueryClient } from "@tanstack/react-query";
 import { useSettings } from "../query/downloadQueries";
 import { tauriClient } from "../tauriClient";
 
@@ -13,7 +14,7 @@ interface ToolbarProps {
 }
 
 const RATE_OPTIONS = [
-  { v: 0, label: "∞" },
+  { v: 0, labelKey: "unlimited" },
   { v: 256 * 1024, label: "256 KB/s" },
   { v: 1024 * 1024, label: "1 MB/s" },
   { v: 5 * 1024 * 1024, label: "5 MB/s" },
@@ -26,14 +27,13 @@ export default function Toolbar({
   const { actions } = useAppContext();
   const { onNewDownload, onExtension, onSettings, onAbout, onQuit, onLog,
     onResumeSelected, onPauseSelected, onDeleteSelected } = actions;
-  const { settings, saveSettings } = useSettings();
+  const queryClient = useQueryClient();
+  const { settings } = useSettings();
 
   const onGlobalRate = async (value: string) => {
     const bps = Number(value);
     await tauriClient.setGlobalRateLimit(bps);
-    if (settings) {
-      await saveSettings({ ...settings, global_rate_limit: bps });
-    }
+    await queryClient.invalidateQueries({ queryKey: ["settings"] });
   };
 
   return (
@@ -58,7 +58,7 @@ export default function Toolbar({
           onChange={(e) => onGlobalRate(e.target.value)}
         >
           {RATE_OPTIONS.map((o) => (
-            <option key={o.v} value={o.v}>{o.label}</option>
+            <option key={o.v} value={o.v}>{o.label ?? t("rateLimit.unlimited")}</option>
           ))}
         </Select>
       </div>

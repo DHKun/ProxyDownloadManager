@@ -10,7 +10,6 @@ import { Checkbox } from "../ui/checkbox";
 import type { FileConflictPolicy } from "../../types";
 
 const THREAD_OPTIONS = [0, 4, 8, 16, 32, 64];
-const THREAD_LABELS: Record<number, string> = { 0: "Auto", 4: "4", 8: "8", 16: "16", 32: "32", 64: "64" };
 const RETRY_OPTIONS = [3, 5, 10, 20, 50];
 
 interface SettingsDialogProps {
@@ -40,8 +39,11 @@ export default function SettingsDialog({ onClose }: SettingsDialogProps) {
             <div>
               <Label>{t("settings.maxThreads")}</Label>
               <Select value={String(settings.max_connections)} onChange={(e) => setSettings({ ...settings, max_connections: Number(e.target.value) })}>
-                {THREAD_OPTIONS.map((n) => <option key={n} value={n}>{THREAD_LABELS[n]}</option>)}
+                {THREAD_OPTIONS.map((n) => (
+                  <option key={n} value={n}>{n === 0 ? t("newDownload.auto") : String(n)}</option>
+                ))}
               </Select>
+              <p className="text-[11px] text-muted-foreground">{t("settings.defaultThreadsHint")}</p>
             </div>
             <div>
               <Label>{t("settings.maxRetries")}</Label>

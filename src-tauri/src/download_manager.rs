@@ -8,6 +8,7 @@ use crate::types::engine_config::item_is_hls;
 use crate::types::*;
 use crate::worker::{Admission, PendingPatch, WorkerPool};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 pub struct DownloadManager {
     ledger: Arc<ProgressLedger>,
@@ -15,6 +16,7 @@ pub struct DownloadManager {
     logger: Mutex<Logger>,
     pub(crate) settings: Arc<SettingsService>,
     bus: Arc<EventBus>,
+    probe_cache: crate::probe::ProbeCache,
 }
 
 impl DownloadManager {
@@ -31,6 +33,7 @@ impl DownloadManager {
             logger: Mutex::new(logger),
             settings,
             bus,
+            probe_cache: crate::probe::ProbeCache::new(),
         }
     }
 
@@ -368,7 +371,8 @@ impl DownloadManager {
             None
         };
         let user_agents = self.settings.build_user_agents();
-        let result = crate::probe::probe_then_default_proxy(
+        let result = crate::probe::cached_probe(
+            &self.probe_cache,
             &url,
             &headers,
             proxy_url.as_deref(),
@@ -426,16 +430,19 @@ impl DownloadManager {
                 "connections cannot be changed in this state".into(),
             ));
         }
-        let applied = if connections == 0 {
-            crate::engine::chunk::auto_connections(item.total_size)
-                .min(crate::engine::chunk::MAX_CONNECTIONS)
+        let settings = self.settings.get();
+        let applied = crate::engine::chunk::compute_connection_count(
+            item.total_size,
+            connections,
+            settings.max_connections,
+        );
+        // 0 stays Auto only when settings is also Auto. A settings default is
+        // a concrete count, so this task does not keep size-detecting.
+        let stored = if connections == 0 && settings.max_connections == 0 {
+            0
         } else {
-            connections
-                .min(crate::engine::chunk::MAX_CONNECTIONS)
-                .max(1)
+            applied
         };
-        // 0 stays stored as Auto; a live worker receives the size-based count.
-        let stored = if connections == 0 { 0 } else { applied };
         let previous = item.connections;
         self.ledger.update_connections(id, stored)?;
         if item.status.is_live() {
@@ -613,8 +620,10 @@ impl DownloadManager {
             None
         };
         let user_agents = self.settings.build_user_agents();
+        let startup = Instant::now();
 
-        let probed = crate::probe::probe_then_default_proxy(
+        let probed = crate::probe::cached_probe(
+            &self.probe_cache,
             &spec.url,
             &headers,
             proxy_url_str.as_deref(),
@@ -623,6 +632,7 @@ impl DownloadManager {
             &user_agents,
         )
         .await;
+        log::debug!("[startup] probe={}ms", startup.elapsed().as_millis());
         let outcome = match probed {
             Ok(r) => {
                 let name = if spec.file_name.is_empty() {
@@ -697,12 +707,14 @@ impl DownloadManager {
         crate::engine::chunk::check_disk_space(&full_path, file_size)?;
 
         let id = self.worker_pool.next_id();
+        let planning = Instant::now();
         let plan = crate::engine::chunk::plan_chunks(
             file_size,
             requested_connections,
             supports_range && !outcome.is_hls,
             settings.max_connections,
         );
+        log::debug!("[startup] planning={}ms", planning.elapsed().as_millis());
 
         let item = DownloadItem {
             id,
@@ -718,7 +730,9 @@ impl DownloadManager {
             },
             parts: plan.parts,
             proxy_name: spec.proxy_name,
-            connections: if requested_connections == 0 {
+            // 0 stays Auto only when settings is also Auto. A settings default
+            // is applied once and stored, so the worker does not size-detect.
+            connections: if requested_connections == 0 && settings.max_connections == 0 {
                 0
             } else {
                 connections
@@ -767,6 +781,7 @@ impl DownloadManager {
             Admission::Queued => self.ledger.mark_queued(id),
             Admission::Started => {}
         }
+        log::debug!("[startup] workers={}ms", startup.elapsed().as_millis());
 
         Ok(id)
     }

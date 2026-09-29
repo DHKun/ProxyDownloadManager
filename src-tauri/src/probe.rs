@@ -2,8 +2,10 @@ use crate::network::pool::NetworkPool;
 use crate::types::{PdmError, PdmResult};
 use std::collections::HashMap;
 use std::error::Error;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ProbeResult {
     pub supports_range: bool,
     pub file_size: u64,
@@ -217,6 +219,111 @@ pub async fn probe_then_default_proxy(
             probe(url, headers, fallback_proxy, pool, user_agents).await
         }
     }
+}
+
+const PROBE_TTL: Duration = Duration::from_secs(20);
+
+struct ProbeCacheEntry {
+    at: Instant,
+    result: ProbeResult,
+}
+
+/// Short-lived probe results so New Download and Start do not hit the network twice.
+pub struct ProbeCache {
+    inner: Mutex<HashMap<String, ProbeCacheEntry>>,
+}
+
+impl ProbeCache {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn get(&self, key: &str) -> Option<ProbeResult> {
+        let mut map = self.inner.lock().ok()?;
+        let fresh = map
+            .get(key)
+            .is_some_and(|entry| entry.at.elapsed() < PROBE_TTL);
+        if fresh {
+            return map.get(key).map(|entry| entry.result.clone());
+        }
+        map.remove(key);
+        None
+    }
+
+    pub fn put(&self, key: String, result: ProbeResult) {
+        if let Ok(mut map) = self.inner.lock() {
+            map.retain(|_, entry| entry.at.elapsed() < PROBE_TTL);
+            map.insert(
+                key,
+                ProbeCacheEntry {
+                    at: Instant::now(),
+                    result,
+                },
+            );
+        }
+    }
+}
+
+fn header_value(headers: &HashMap<String, String>, names: &[&str]) -> String {
+    for name in names {
+        if let Some((_, value)) = headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        {
+            return value.clone();
+        }
+    }
+    String::new()
+}
+
+/// Identity of a probe. A different URL, proxy, user-agent, or auth header misses.
+pub fn probe_cache_key(
+    url: &str,
+    proxy: Option<&str>,
+    headers: &HashMap<String, String>,
+    user_agents: &[String],
+) -> String {
+    let ua = user_agents.first().map(String::as_str).unwrap_or("");
+    format!(
+        "{url}\n{}\n{ua}\n{}\n{}\n{}\n{}",
+        proxy.unwrap_or(""),
+        header_value(headers, &["cookie"]),
+        header_value(headers, &["authorization"]),
+        header_value(headers, &["referer", "referrer"]),
+        header_value(headers, &["origin"]),
+    )
+}
+
+/// Return a cached probe, or run one and store it. The key is the primary proxy,
+/// so a result taken through proxy A is not reused for proxy B.
+pub async fn cached_probe(
+    cache: &ProbeCache,
+    url: &str,
+    headers: &HashMap<String, String>,
+    primary_proxy: Option<&str>,
+    fallback_proxy: Option<&str>,
+    pool: &NetworkPool,
+    user_agents: &[String],
+) -> PdmResult<ProbeResult> {
+    let key = probe_cache_key(url, primary_proxy, headers, user_agents);
+    if let Some(hit) = cache.get(&key) {
+        log::debug!("[startup] probe-cache=hit");
+        return Ok(hit);
+    }
+    log::debug!("[startup] probe-cache=miss");
+    let result = probe_then_default_proxy(
+        url,
+        headers,
+        primary_proxy,
+        fallback_proxy,
+        pool,
+        user_agents,
+    )
+    .await?;
+    cache.put(key, result.clone());
+    Ok(result)
 }
 
 /// Probe with fallback: on failure, derive filename from URL.
@@ -542,5 +649,85 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, PdmError::Http(403) | PdmError::Probe(_)));
+    }
+
+    #[test]
+    fn probe_cache_key_changes_with_proxy_and_auth_headers() {
+        let uas = vec!["ua".to_string()];
+        let bare = HashMap::new();
+        let direct = probe_cache_key("http://example/a.bin", None, &bare, &uas);
+        let proxied = probe_cache_key(
+            "http://example/a.bin",
+            Some("http://127.0.0.1:9"),
+            &bare,
+            &uas,
+        );
+        assert_ne!(direct, proxied);
+        for (name, value) in [
+            ("Cookie", "sid=1"),
+            ("Authorization", "Bearer t"),
+            ("Referer", "https://from.example/"),
+            ("Origin", "https://from.example"),
+        ] {
+            let mut headers = HashMap::new();
+            headers.insert(name.to_string(), value.to_string());
+            assert_ne!(
+                direct,
+                probe_cache_key("http://example/a.bin", None, &headers, &uas),
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_probe_reuses_one_response() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let count = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                count.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = stream.read(&mut buf).await;
+                    let body = b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/1000\r\nContent-Length: 1\r\nContent-Disposition: attachment; filename=a.bin\r\n\r\nX";
+                    let _ = stream.write_all(body).await;
+                });
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}/a.bin");
+        let cache = ProbeCache::new();
+        let pool = Arc::new(NetworkPool::new(false));
+        let uas = vec!["ua".to_string()];
+        let headers = HashMap::new();
+        let first = cached_probe(&cache, &url, &headers, None, None, &pool, &uas)
+            .await
+            .unwrap();
+        let second = cached_probe(&cache, &url, &headers, None, None, &pool, &uas)
+            .await
+            .unwrap();
+        assert_eq!(first.file_size, 1000);
+        assert_eq!(second.file_size, 1000);
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            1,
+            "start reused a fresh probe"
+        );
+        let mut cookied = HashMap::new();
+        cookied.insert("Cookie".into(), "sid=1".into());
+        cached_probe(&cache, &url, &cookied, None, None, &pool, &uas)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            2,
+            "a cookied download reused a cookieless probe"
+        );
     }
 }

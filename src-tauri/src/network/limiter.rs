@@ -134,6 +134,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_bps_zero_does_not_keep_the_old_allowance() {
+        let limiter = RateLimiter::new(256 * 1024);
+        limiter.wait_n(1024).await;
+        limiter.set_bps(0);
+        let start = Instant::now();
+        limiter.wait_n(10 * 1024 * 1024).await;
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "unlimited wait took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
     async fn test_wait_n_respects_bps() {
         let limiter = RateLimiter::new(80_000);
         let start = Instant::now();

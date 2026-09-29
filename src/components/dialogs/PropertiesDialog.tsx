@@ -31,7 +31,7 @@ export default function PropertiesDialog({ id, onClose }: PropertiesDialogProps)
         <InfoRow label={t("properties.savePath")} value={item.save_path} />
         <InfoRow label={t("properties.connections")} value={String(item.connections)} />
         <InfoRow label={t("properties.proxy")} value={item.proxy_name || t("properties.none")} />
-        <InfoRow label={t("properties.speedLimit")} value={formatRateLimit(item.rate_limit_bps || 0)} />
+        <InfoRow label={t("properties.speedLimit")} value={(item.rate_limit_bps ?? 0) > 0 ? formatRateLimit(item.rate_limit_bps ?? 0) : t("rateLimit.unlimited")} />
         <div className="flex items-start gap-2 text-[13px]">
           <div className="w-32 shrink-0 text-muted-foreground">{t("properties.url")}</div>
           <div className="min-w-0 flex-1 break-all">{item.url}</div>

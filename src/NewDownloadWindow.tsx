@@ -33,6 +33,7 @@ export default function NewDownloadWindow() {
   const timer = useRef<number | null>(null);
   const filenameRef = useRef(filename);
   const autoFilledRef = useRef(autoFilled);
+  const connectionTouched = useRef(false);
   filenameRef.current = filename;
   autoFilledRef.current = autoFilled;
 
@@ -41,6 +42,12 @@ export default function NewDownloadWindow() {
       setLanguage(loadedSettings.language || "en");
       setProxyName(loadedSettings.default_proxy);
       setSavePath(loadedSettings.download_dir);
+      // A configured default is the starting thread count. Auto stays only
+      // when settings itself is Auto, so a number is not size-detected.
+      if (!connectionTouched.current && loadedSettings.max_connections > 0) {
+        setConnectionMode("manual");
+        setManualConnections(loadedSettings.max_connections);
+      }
     }
   }, [loadedSettings]);
 
@@ -59,6 +66,7 @@ export default function NewDownloadWindow() {
       if (fn) { setFilename(fn); setAutoFilled(true); }
     }
     if (req.connections) {
+      connectionTouched.current = true;
       setConnectionMode("manual");
       setManualConnections(req.connections);
     }
@@ -229,6 +237,7 @@ export default function NewDownloadWindow() {
           <Select
             value={connectionMode === "auto" ? "0" : String(manualConnections)}
             onChange={(e) => {
+              connectionTouched.current = true;
               const n = Number(e.target.value);
               if (n === 0) setConnectionMode("auto");
               else {

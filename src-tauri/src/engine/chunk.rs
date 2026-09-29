@@ -96,33 +96,45 @@ pub fn plan_chunks(
     ChunkPlan { connections, parts }
 }
 
-pub fn compute_connection_count(file_size: u64, requested: u32, max_connections: u32) -> u32 {
-    let hard_max = if max_connections == 0 {
-        MAX_CONNECTIONS
-    } else {
-        max_connections.min(MAX_CONNECTIONS).max(1)
-    };
+/// Resolve how many connections a download actually opens.
+///
+/// `default_connections` is the settings value. `0` means Auto and the count
+/// comes from the file size. Any other value is the default thread count: a
+/// task that did not choose its own count uses it directly and does not
+/// size-detect. An explicit `requested` count is not clamped by that default.
+pub fn compute_connection_count(file_size: u64, requested: u32, default_connections: u32) -> u32 {
     if requested > 0 {
-        return requested.clamp(1, hard_max);
+        return requested.clamp(1, MAX_CONNECTIONS);
     }
-    auto_connections(file_size).clamp(1, hard_max)
+    if default_connections > 0 {
+        return default_connections.clamp(1, MAX_CONNECTIONS);
+    }
+    auto_connections(file_size).clamp(1, MAX_CONNECTIONS)
 }
 
-/// Initial Auto strategy. Dynamic segmentation may raise concurrency later.
+/// Initial Auto strategy. Capped at 8.
+///
+/// TODO: start at 4 and raise only when throughput improves and retries stay low.
+/// A proxy does not get more than a direct connection; both stop at 8.
 pub fn auto_connections(file_size: u64) -> u32 {
+    auto_connections_for(file_size, false)
+}
+
+pub fn auto_connections_for(file_size: u64, via_proxy: bool) -> u32 {
     const MIB: u64 = 1024 * 1024;
-    if file_size == 0 {
+    let n = if file_size == 0 {
         2
     } else if file_size < 2 * MIB {
         1
     } else if file_size < 16 * MIB {
         4
-    } else if file_size < 128 * MIB {
-        8
-    } else if file_size < 1024 * MIB {
-        16
     } else {
-        32
+        8
+    };
+    if via_proxy {
+        n.min(8)
+    } else {
+        n
     }
 }
 
@@ -322,12 +334,11 @@ mod tests {
 
     #[test]
     fn auto_plan_for_large_file_is_many_parts_not_one() {
-        // The Kali ISO size. Auto must plan 32 parts that cover the file.
-        // compute_chunks(size, 1) is the old Auto bug: one full-file task.
+        // The Kali ISO size. Auto plans several parts, not one full-file task.
         let size = 4_831_174_656u64;
-        let plan = plan_chunks(size, 0, true, 64);
-        assert_eq!(plan.connections, 32);
-        assert_eq!(plan.parts.len(), 32);
+        let plan = plan_chunks(size, 0, true, 0);
+        assert_eq!(plan.connections, 8);
+        assert_eq!(plan.parts.len(), 8);
         let ranges: Vec<crate::engine::part_progress::PartRange> = plan
             .parts
             .iter()
@@ -340,7 +351,7 @@ mod tests {
             &ranges,
             &vec![0; ranges.len()],
         );
-        assert_eq!(tasks.len(), 32);
+        assert_eq!(tasks.len(), 8);
         assert_eq!(tasks.iter().map(|t| t.length).sum::<u64>(), size);
         assert_eq!(compute_chunks(size, 1, 0).len(), 1);
         assert_eq!(compute_chunks(size, 0, 0).len(), 1);
@@ -351,19 +362,34 @@ mod tests {
         assert_eq!(auto_connections(1024), 1);
         assert_eq!(auto_connections(3 * 1024 * 1024), 4);
         assert_eq!(auto_connections(32 * 1024 * 1024), 8);
-        assert_eq!(auto_connections(200 * 1024 * 1024), 16);
-        assert_eq!(auto_connections(2 * 1024 * 1024 * 1024), 32);
+        assert_eq!(auto_connections(200 * 1024 * 1024), 8);
+        assert_eq!(auto_connections(2 * 1024 * 1024 * 1024), 8);
+        assert_eq!(auto_connections_for(2 * 1024 * 1024 * 1024, true), 8);
+        assert_eq!(auto_connections(600 * 1024 * 1024), 8);
     }
 
     #[test]
     fn requested_connections_honor_64() {
         assert_eq!(compute_connection_count(10 * 1024 * 1024 * 1024, 64, 0), 64);
+        // A settings default is not a cap on an explicit per-download count.
         assert_eq!(
             compute_connection_count(10 * 1024 * 1024 * 1024, 64, 32),
-            32
+            64
         );
         assert_eq!(compute_connection_count(1024, 0, 0), 1);
         assert_eq!(compute_connection_count(8 * 1024 * 1024, 0, 0), 4);
+    }
+
+    #[test]
+    fn settings_default_skips_size_detection() {
+        let iso = 4_831_174_656u64;
+        assert_eq!(compute_connection_count(iso, 0, 16), 16);
+        // A tiny file would be 1 under Auto. A configured default stays 16.
+        assert_eq!(compute_connection_count(1024, 0, 16), 16);
+        assert_eq!(compute_connection_count(iso, 4, 16), 4);
+        let plan = plan_chunks(iso, 0, true, 16);
+        assert_eq!(plan.connections, 16);
+        assert_eq!(plan.parts.len(), 16);
     }
 
     #[test]

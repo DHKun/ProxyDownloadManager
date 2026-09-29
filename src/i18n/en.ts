@@ -32,6 +32,7 @@ const en = {
   rateLimit: {
     unlimited: "Unlimited",
     global: "Speed limit",
+    taskUnlimitedUnderGlobal: "Unlimited (global {rate} still applies)",
   },
   downloadRow: {
     open: "Open",
@@ -120,7 +121,8 @@ const en = {
     app: "App",
     downloadDir: "Download Directory",
     browse: "Browse",
-    maxThreads: "Max Threads",
+    maxThreads: "Default threads",
+    defaultThreadsHint: "A number is used as-is for new downloads. Auto still picks from the file size.",
     retries: "Retries",
     maxRetries: "Max Retries",
     userAgent: "User-Agent",

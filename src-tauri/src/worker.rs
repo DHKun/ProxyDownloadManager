@@ -156,7 +156,7 @@ impl WorkerPool {
         // 0 means Auto: pick from the file size here. Storing 0 in the ledger
         // keeps the UI on Auto; the live worker still needs a concrete count.
         let initial = if cfg.connections == 0 {
-            crate::engine::chunk::auto_connections(cfg.total_size)
+            crate::engine::chunk::auto_connections_for(cfg.total_size, !cfg.proxy_url.is_empty())
                 .min(crate::engine::chunk::MAX_CONNECTIONS)
                 .max(1)
         } else {
@@ -169,6 +169,12 @@ impl WorkerPool {
             .clone()
             .unwrap_or_else(|| Arc::new(AtomicU32::new(initial)));
         cfg.desired_connections = Some(desired.clone());
+        log::debug!(
+            "[rate] id={} global={} task={}",
+            id,
+            ctx.global_limiter.bps(),
+            cfg.rate_limit_bps
+        );
         let limiter = Arc::new(MultiLimiter::with_global(
             ctx.global_limiter.clone(),
             cfg.rate_limit_bps,
@@ -310,6 +316,7 @@ impl WorkerPool {
     }
 
     pub fn set_global_rate_limit(&self, bps: u64) {
+        log::debug!("[rate] global={}", bps);
         self.global_limiter.set_bps(bps);
     }
 

@@ -181,6 +181,9 @@ impl ConcurrentDownloader {
                     .iter()
                     .fold(0u64, |acc, n| acc.wrapping_mul(31).wrapping_add(*n));
                 if size != last_bytes || parts_hash != last_parts {
+                    if size > 0 && (last_bytes == 0 || last_bytes == u64::MAX) {
+                        log::debug!("[startup] first-progress id={} bytes={}", download_id, size);
+                    }
                     last_bytes = size;
                     last_parts = parts_hash;
                     let _ = progress_tx.send(Event {
@@ -199,6 +202,7 @@ impl ConcurrentDownloader {
             .clone()
             .unwrap_or_else(|| std::sync::Arc::new(AtomicU32::new(num_workers)));
         let live_workers = std::sync::Arc::new(AtomicU32::new(0));
+        let phase = std::sync::Arc::new(PhaseCounts::default());
 
         let make_worker = || ChunkWorker {
             queue: queue.clone(),
@@ -218,6 +222,7 @@ impl ConcurrentDownloader {
             event_tx: self.event_tx.clone(),
             download_id,
             expected_total: cfg.total_size,
+            phase: phase.clone(),
         };
 
         for _worker_id in 0..num_workers {
@@ -356,6 +361,7 @@ struct ChunkWorker {
     event_tx: mpsc::UnboundedSender<Event>,
     download_id: u64,
     expected_total: u64,
+    phase: Arc<PhaseCounts>,
 }
 
 impl Clone for ChunkWorker {
@@ -378,8 +384,47 @@ impl Clone for ChunkWorker {
             event_tx: self.event_tx.clone(),
             download_id: self.download_id,
             expected_total: self.expected_total,
+            phase: self.phase.clone(),
         }
     }
+}
+
+struct PhaseCounts {
+    working: AtomicU32,
+    retrying: AtomicU32,
+    last: std::sync::Mutex<String>,
+}
+
+impl Default for PhaseCounts {
+    fn default() -> Self {
+        Self {
+            working: AtomicU32::new(0),
+            retrying: AtomicU32::new(0),
+            last: std::sync::Mutex::new(String::new()),
+        }
+    }
+}
+
+fn publish_phase(counts: &PhaseCounts, tx: &mpsc::UnboundedSender<Event>, id: u64) {
+    let working = counts.working.load(Ordering::Relaxed);
+    let retrying = counts.retrying.load(Ordering::Relaxed);
+    let phase = if working > 0 {
+        "downloading"
+    } else if retrying > 0 {
+        "retrying"
+    } else {
+        return;
+    };
+    let mut last = match counts.last.lock() {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
+    if last.as_str() == phase {
+        return;
+    }
+    last.clear();
+    last.push_str(phase);
+    emit_phase(tx, id, phase);
 }
 
 fn emit_phase(tx: &mpsc::UnboundedSender<Event>, id: u64, phase: &str) {
@@ -397,6 +442,7 @@ fn spawn_chunk_worker(env: ChunkWorker) -> tokio::task::JoinHandle<()> {
     env.live_workers.fetch_add(1, Ordering::Relaxed);
     tokio::spawn(async move {
         let mut retries_left = env.max_retries;
+        let mut budget_key: Option<(u64, u64)> = None;
         let stop_worker = |live: &AtomicU32| {
             live.fetch_sub(1, Ordering::Relaxed);
         };
@@ -438,7 +484,14 @@ fn spawn_chunk_worker(env: ChunkWorker) -> tokio::task::JoinHandle<()> {
                 env.download_id,
                 task.offset
             );
+            let key = (task.offset, task.length);
+            if budget_key != Some(key) {
+                retries_left = env.max_retries;
+                budget_key = Some(key);
+            }
 
+            env.phase.working.fetch_add(1, Ordering::Relaxed);
+            publish_phase(&env.phase, &env.event_tx, env.download_id);
             let result = download_task(
                 &env.url,
                 &env.client,
@@ -451,8 +504,10 @@ fn spawn_chunk_worker(env: ChunkWorker) -> tokio::task::JoinHandle<()> {
                 Some(env.parts.clone()),
                 env.headers.as_ref(),
                 env.expected_total,
+                crate::engine::task_download::BODY_IDLE,
             )
             .await;
+            env.phase.working.fetch_sub(1, Ordering::Relaxed);
 
             match result {
                 TaskResult::Complete => {
@@ -491,18 +546,21 @@ fn spawn_chunk_worker(env: ChunkWorker) -> tokio::task::JoinHandle<()> {
                             retries_left
                         );
                         env.queue.push(task);
-                        emit_phase(&env.event_tx, env.download_id, "retrying");
+                        env.phase.retrying.fetch_add(1, Ordering::Relaxed);
+                        publish_phase(&env.phase, &env.event_tx, env.download_id);
                         let attempt = env.max_retries - retries_left;
                         let delay = crate::retry::backoff_delay(attempt);
                         let deadline = std::time::Instant::now() + delay;
                         while std::time::Instant::now() < deadline {
                             if env.stop.load(Ordering::Relaxed) {
+                                env.phase.retrying.fetch_sub(1, Ordering::Relaxed);
                                 stop_worker(&env.live_workers);
                                 return;
                             }
                             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         }
-                        emit_phase(&env.event_tx, env.download_id, "downloading");
+                        env.phase.retrying.fetch_sub(1, Ordering::Relaxed);
+                        publish_phase(&env.phase, &env.event_tx, env.download_id);
                     }
                 }
                 TaskResult::Cancelled => {
@@ -536,20 +594,46 @@ fn spawn_chunk_worker(env: ChunkWorker) -> tokio::task::JoinHandle<()> {
                     }
                     retries_left -= 1;
                     env.queue.push(task);
-                    emit_phase(&env.event_tx, env.download_id, "retrying");
+                    env.phase.retrying.fetch_add(1, Ordering::Relaxed);
+                    publish_phase(&env.phase, &env.event_tx, env.download_id);
                     let attempt = env.max_retries - retries_left;
                     let delay = crate::retry::backoff_delay(attempt);
                     let deadline = std::time::Instant::now() + delay;
                     while std::time::Instant::now() < deadline {
                         if env.stop.load(Ordering::Relaxed) {
+                            env.phase.retrying.fetch_sub(1, Ordering::Relaxed);
                             stop_worker(&env.live_workers);
                             return;
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
-                    emit_phase(&env.event_tx, env.download_id, "downloading");
+                    env.phase.retrying.fetch_sub(1, Ordering::Relaxed);
+                    publish_phase(&env.phase, &env.event_tx, env.download_id);
                 }
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_retrying_worker_does_not_flip_the_task_off_downloading() {
+        let counts = PhaseCounts::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        counts.working.store(1, Ordering::Relaxed);
+        counts.retrying.store(1, Ordering::Relaxed);
+        publish_phase(&counts, &tx, 7);
+        let data = rx.try_recv().unwrap().data.unwrap();
+        assert!(data.contains("downloading"), "{data}");
+        publish_phase(&counts, &tx, 7);
+        assert!(rx.try_recv().is_err(), "unchanged phase was emitted again");
+
+        counts.working.store(0, Ordering::Relaxed);
+        publish_phase(&counts, &tx, 7);
+        let data = rx.try_recv().unwrap().data.unwrap();
+        assert!(data.contains("retrying"), "{data}");
+    }
 }

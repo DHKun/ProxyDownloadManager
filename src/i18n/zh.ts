@@ -34,6 +34,7 @@ const zh: Translations = {
   rateLimit: {
     unlimited: "不限速",
     global: "全局限速",
+    taskUnlimitedUnderGlobal: "不限速（受全局 {rate} 限制）",
   },
   downloadRow: {
     open: "打开",
@@ -122,7 +123,8 @@ const zh: Translations = {
     app: "应用",
     downloadDir: "下载目录",
     browse: "浏览",
-    maxThreads: "最大线程",
+    maxThreads: "默认线程",
+    defaultThreadsHint: "选具体数值后，新下载直接用这个线程数，不再按文件大小自动选择。选自动则仍按文件大小决定。",
     retries: "重试",
     maxRetries: "最大重试",
     userAgent: "用户代理",

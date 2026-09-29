@@ -163,8 +163,10 @@ impl SingleDownloader {
         use futures_util::StreamExt;
         let mut stream = std::pin::pin!(stream);
         let mut total = start_at;
-        const BUF_SIZE: usize = 1024 * 1024;
-        let mut buf = Vec::with_capacity(BUF_SIZE);
+        const WRITE_BUFFER: usize = 256 * 1024;
+        let mut buf = Vec::with_capacity(WRITE_BUFFER);
+        let mut last_flush = std::time::Instant::now();
+        let mut last_byte = std::time::Instant::now();
 
         let save_progress = |written: u64, id: u64, cfg: &EngineConfig| {
             let size = if expected > 0 {
@@ -204,12 +206,38 @@ impl SingleDownloader {
                 return Err(PdmError::Cancelled);
             }
 
-            let chunk_result =
-                tokio::time::timeout(std::time::Duration::from_secs(10), stream.next()).await;
+            let idle_left =
+                crate::engine::task_download::BODY_IDLE.saturating_sub(last_byte.elapsed());
+            let flush_left = if buf.is_empty() {
+                None
+            } else {
+                Some(std::time::Duration::from_millis(250).saturating_sub(last_flush.elapsed()))
+            };
+            let chunk_result = if let Some(flush_left) = flush_left {
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep(flush_left) => {
+                        file.write_all(&buf)
+                            .map_err(|e| PdmError::Io(e.to_string()))?;
+                        total += buf.len() as u64;
+                        buf.clear();
+                        last_flush = std::time::Instant::now();
+                        let _ = self.event_tx.send(Event {
+                            kind: EventKind::DownloadProgress,
+                            download_id: cfg.id,
+                            data: Some(encode_progress_data(total, &[total], true)),
+                        });
+                        continue;
+                    }
+                    result = tokio::time::timeout(idle_left, stream.next()) => result,
+                }
+            } else {
+                tokio::time::timeout(idle_left, stream.next()).await
+            };
             let chunk = match chunk_result {
                 Ok(Some(c)) => c,
                 Ok(None) => break,
-                Err(_elapsed) => {
+                Err(_) => {
                     if cancel.load(Ordering::Relaxed) {
                         if !buf.is_empty() {
                             let _ = file.write_all(&buf);
@@ -220,18 +248,23 @@ impl SingleDownloader {
                         save_progress(total, cfg.id, cfg);
                         return Err(PdmError::Cancelled);
                     }
-                    continue;
+                    return Err(PdmError::Network("body idle timeout".into()));
                 }
             };
             let chunk = chunk.map_err(|e| PdmError::Network(e.to_string()))?;
+            if chunk.is_empty() {
+                continue;
+            }
             limiter.wait_n(chunk.len() as u64).await;
+            last_byte = std::time::Instant::now();
             buf.extend_from_slice(&chunk);
 
-            if buf.len() >= BUF_SIZE {
+            if buf.len() >= WRITE_BUFFER {
                 file.write_all(&buf)
                     .map_err(|e| PdmError::Io(e.to_string()))?;
                 total += buf.len() as u64;
                 buf.clear();
+                last_flush = std::time::Instant::now();
 
                 let _ = self.event_tx.send(Event {
                     kind: EventKind::DownloadProgress,

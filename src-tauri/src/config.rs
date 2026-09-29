@@ -89,6 +89,27 @@ mod tests {
     }
 
     #[test]
+    fn missing_global_rate_limit_is_unlimited() {
+        let toml_str = toml::to_string(&Settings::default()).unwrap();
+        let without = toml_str
+            .lines()
+            .filter(|line| !line.starts_with("global_rate_limit"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let back: Settings = toml::from_str(&without).unwrap();
+        assert_eq!(back.global_rate_limit, 0);
+        assert_eq!(back.max_retries, Settings::default().max_retries);
+    }
+
+    #[test]
+    fn saved_global_rate_limit_is_kept() {
+        let mut s = Settings::default();
+        s.global_rate_limit = 262144;
+        let back: Settings = toml::from_str(&toml::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.global_rate_limit, 262144);
+    }
+
+    #[test]
     fn test_settings_default_serializable() {
         let s = Settings::default();
         let toml_str = toml::to_string(&s).unwrap();
