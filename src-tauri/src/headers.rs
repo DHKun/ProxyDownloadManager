@@ -140,7 +140,12 @@ pub fn redact_headers(headers: &HashMap<String, String>) -> HashMap<String, Stri
 /// Redact sensitive tokens inside a free-form log line.
 pub fn redact_log(line: &str) -> String {
     let mut out = line.to_string();
-    for name in ["Authorization", "Cookie", "Proxy-Authorization", "Set-Cookie"] {
+    for name in [
+        "Authorization",
+        "Cookie",
+        "Proxy-Authorization",
+        "Set-Cookie",
+    ] {
         // JSON: "Cookie": "..."
         let json_pat = format!("\"{}\"", name);
         if let Some(idx) = find_ci(&out, &json_pat) {
@@ -160,8 +165,7 @@ pub fn redact_log(line: &str) -> String {
 }
 
 fn find_ci(hay: &str, needle: &str) -> Option<usize> {
-    hay.to_ascii_lowercase()
-        .find(&needle.to_ascii_lowercase())
+    hay.to_ascii_lowercase().find(&needle.to_ascii_lowercase())
 }
 
 fn redact_from(s: &str, start: usize) -> String {
@@ -205,7 +209,9 @@ mod tests {
         assert_eq!(out.get("Cookie").unwrap(), "sid=1");
         assert_eq!(out.get("Referer").unwrap(), "https://example.com/");
         assert!(!out.keys().any(|k| k.eq_ignore_ascii_case("host")));
-        assert!(!out.keys().any(|k| k.to_ascii_lowercase().starts_with("sec-")));
+        assert!(!out
+            .keys()
+            .any(|k| k.to_ascii_lowercase().starts_with("sec-")));
         assert!(!out.keys().any(|k| k.eq_ignore_ascii_case("content-length")));
     }
 

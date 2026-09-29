@@ -1,5 +1,5 @@
-use crate::types::*;
 use crate::network::pool::NetworkPool;
+use crate::types::*;
 use std::sync::Arc;
 
 pub struct NetworkService {
@@ -25,10 +25,15 @@ impl NetworkService {
             .map_err(|e| format!("Failed to check update: {}", e))?;
 
         if !resp.status().is_success() {
-            return Err(PdmError::Other(format!("GitHub API responded with status {}", resp.status())));
+            return Err(PdmError::Other(format!(
+                "GitHub API responded with status {}",
+                resp.status()
+            )));
         }
 
-        let body = resp.text().await
+        let body = resp
+            .text()
+            .await
             .map_err(|e| format!("Failed to read response: {}", e))?;
         Ok(serde_json::from_str(&body)
             .map_err(|e| format!("Failed to parse release info: {}", e))?)

@@ -1,7 +1,10 @@
-use crate::network::pool::NetworkPool;
-use crate::network::limiter::MultiLimiter;
+use crate::engine::file_io::{self, length_shortfall};
 use crate::engine::part_progress::encode_progress_data;
-use crate::types::{PdmError, PdmResult, Event, EventKind, EngineConfig};
+use crate::engine::task_download::{parse_content_range, validate_content_range};
+use crate::network::limiter::MultiLimiter;
+use crate::network::pool::NetworkPool;
+use crate::types::{EngineConfig, Event, EventKind, PdmError, PdmResult};
+use std::io::{Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -16,69 +19,167 @@ impl SingleDownloader {
         Self { pool, event_tx }
     }
 
-    pub async fn download(&self, cfg: &EngineConfig, limiter: Arc<MultiLimiter>, cancel: Arc<AtomicBool>, on_resume: &crate::engine::OnResumeState) -> PdmResult<()> {
+    pub async fn download(
+        &self,
+        cfg: &EngineConfig,
+        limiter: Arc<MultiLimiter>,
+        cancel: Arc<AtomicBool>,
+        on_resume: &crate::engine::OnResumeState,
+    ) -> PdmResult<()> {
         log::info!("[ProxyDM] single id={} url={}", cfg.id, cfg.url);
-        let mut req = self.pool
-            .get_client(if cfg.proxy_url.is_empty() { None } else { Some(&cfg.proxy_url) })
+        let resume_from = if cfg.is_resume && cfg.downloaded > 0 {
+            cfg.downloaded
+        } else {
+            0
+        };
+
+        let mut req = self
+            .pool
+            .get_client(if cfg.proxy_url.is_empty() {
+                None
+            } else {
+                Some(&cfg.proxy_url)
+            })
             .map_err(|e| PdmError::ClientBuild(e.to_string()))?
             .get(&cfg.url);
+        if resume_from > 0 {
+            req = req.header("Range", format!("bytes={resume_from}-"));
+        }
         req = crate::headers::apply_headers(req, &cfg.headers, &cfg.user_agent);
         let resp = req
             .send()
             .await
             .map_err(|e| PdmError::Network(e.to_string()))?;
-        log::info!("[ProxyDM] single id={} HTTP {} size={}", cfg.id, resp.status(),
-            resp.headers().get("content-length").and_then(|v| v.to_str().ok()).unwrap_or("?"));
+        log::info!("[ProxyDM] single id={} HTTP {}", cfg.id, resp.status());
 
         if cancel.load(Ordering::Relaxed) {
             return Err(PdmError::Cancelled);
         }
 
         let status = resp.status();
-        if !status.is_success() {
-            // Handle 429/503 with Retry-After
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-                let retry_after = resp.headers()
+        if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            {
+                let retry_after = resp
+                    .headers()
                     .get("retry-after")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or(5);
-                return Err(PdmError::Other(format!("Rate limited, retry after {}s", retry_after)));
+                return Err(PdmError::Other(format!(
+                    "Rate limited, retry after {}s",
+                    retry_after
+                )));
             }
             return Err(PdmError::Http(status.as_u16()));
         }
 
-        // Ensure output directory exists
-        if let Some(parent) = std::path::Path::new(&cfg.save_path).parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| PdmError::Io(e.to_string()))?;
+        // 206 continues at resume_from. Anything else (200, or a 206 whose
+        // range doesn't start where we left off) restarts from byte 0.
+        let mut start_at = 0u64;
+        let mut restart = false;
+        if resume_from > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT {
+            let header = resp
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_content_range);
+            if let Some((start, end, total)) = header {
+                if validate_content_range(resume_from, u64::MAX, start, end, total, cfg.total_size)
+                {
+                    start_at = resume_from;
+                } else {
+                    log::warn!(
+                        "[ProxyDM] single id={} resume range rejected, restarting",
+                        cfg.id
+                    );
+                    restart = true;
+                }
+            } else {
+                log::warn!(
+                    "[ProxyDM] single id={} 206 without Content-Range, restarting",
+                    cfg.id
+                );
+                restart = true;
+            }
+        } else if resume_from > 0 && status != reqwest::StatusCode::OK {
+            restart = true;
+        } else if resume_from > 0 {
+            log::info!(
+                "[ProxyDM] single id={} server has no Range, restarting from 0",
+                cfg.id
+            );
         }
 
-        // Use std::fs::File (no tokio overhead for sequential write)
-        // Write to .pdm temp file for crash safety, rename on completion
-        let pdm_path = crate::engine::file_io::pdm_path(&cfg.save_path);
-        use std::io::Write;
-        let mut file = std::fs::File::create(&pdm_path)
+        let content_len = resp
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+        let expected = if cfg.total_size > 0 {
+            cfg.total_size
+        } else {
+            content_len.map(|n| start_at + n).unwrap_or(0)
+        };
+
+        file_io::migrate_legacy_temp(cfg.id, &cfg.save_path);
+        let pdm_path = file_io::temp_path(cfg.id);
+        if let Some(parent) = std::path::Path::new(&pdm_path).parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| PdmError::Io(e.to_string()))?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .open(&pdm_path)
             .map_err(|e| PdmError::Io(e.to_string()))?;
+        if restart {
+            return Err(PdmError::Incomplete(format!(
+                "resume rejected at offset {resume_from}"
+            )));
+        }
+        if start_at == 0 {
+            file.set_len(0).map_err(|e| PdmError::Io(e.to_string()))?;
+        } else {
+            let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            if len < start_at {
+                return Err(PdmError::Incomplete(format!(
+                    "temp file is {len} bytes, resume offset is {start_at}"
+                )));
+            }
+            file.seek(SeekFrom::Start(start_at))
+                .map_err(|e| PdmError::Io(e.to_string()))?;
+        }
 
         let stream = resp.bytes_stream();
         use futures_util::StreamExt;
         let mut stream = std::pin::pin!(stream);
-        let mut total = 0u64;
-        const BUF_SIZE: usize = 1024 * 1024; // 1MB buffer
+        let mut total = start_at;
+        const BUF_SIZE: usize = 1024 * 1024;
         let mut buf = Vec::with_capacity(BUF_SIZE);
 
-        // Helper: save current progress for resume via callback
-        let save_progress = |written: u64, total_size: u64, id: u64, cfg: &EngineConfig| {
-            let remaining = total_size.saturating_sub(written);
-            if remaining > 0 {
+        let save_progress = |written: u64, id: u64, cfg: &EngineConfig| {
+            let size = if expected > 0 {
+                expected
+            } else {
+                cfg.total_size
+            };
+            let remaining = size.saturating_sub(written);
+            if written > 0 && (size == 0 || remaining > 0) {
                 let saved = crate::types::DownloadState {
                     url: cfg.url.clone(),
                     id,
                     file_name: cfg.file_name.clone(),
                     save_path: cfg.save_path.clone(),
-                    total_size,
+                    total_size: size,
                     downloaded: written,
-                    tasks: vec![crate::types::Task { offset: written, length: remaining }],
+                    tasks: vec![crate::types::Task {
+                        offset: written,
+                        length: remaining,
+                    }],
                     proxy_name: cfg.proxy_name.clone(),
                     workers: 1,
                 };
@@ -87,20 +188,19 @@ impl SingleDownloader {
         };
 
         loop {
-            // Check cancel between chunks for responsive pause
             if cancel.load(Ordering::Relaxed) {
                 if !buf.is_empty() {
                     let _ = file.write_all(&buf);
                     total += buf.len() as u64;
                     buf.clear();
                 }
-                save_progress(total, cfg.total_size, cfg.id, cfg);
+                let _ = file.flush();
+                save_progress(total, cfg.id, cfg);
                 return Err(PdmError::Cancelled);
             }
 
-            let chunk_result = tokio::time::timeout(
-                std::time::Duration::from_secs(10), stream.next()
-            ).await;
+            let chunk_result =
+                tokio::time::timeout(std::time::Duration::from_secs(10), stream.next()).await;
             let chunk = match chunk_result {
                 Ok(Some(c)) => c,
                 Ok(None) => break,
@@ -111,7 +211,8 @@ impl SingleDownloader {
                             total += buf.len() as u64;
                             buf.clear();
                         }
-                        save_progress(total, cfg.total_size, cfg.id, cfg);
+                        let _ = file.flush();
+                        save_progress(total, cfg.id, cfg);
                         return Err(PdmError::Cancelled);
                     }
                     continue;
@@ -122,7 +223,8 @@ impl SingleDownloader {
             buf.extend_from_slice(&chunk);
 
             if buf.len() >= BUF_SIZE {
-                file.write_all(&buf).map_err(|e| PdmError::Io(e.to_string()))?;
+                file.write_all(&buf)
+                    .map_err(|e| PdmError::Io(e.to_string()))?;
                 total += buf.len() as u64;
                 buf.clear();
 
@@ -134,21 +236,30 @@ impl SingleDownloader {
             }
         }
 
-        // Flush remainder
         if !buf.is_empty() {
-            file.write_all(&buf).map_err(|e| PdmError::Io(e.to_string()))?;
+            file.write_all(&buf)
+                .map_err(|e| PdmError::Io(e.to_string()))?;
             total += buf.len() as u64;
         }
         file.flush().map_err(|e| PdmError::Io(e.to_string()))?;
+        file.sync_all().map_err(|e| PdmError::Io(e.to_string()))?;
         drop(file);
 
-        // Rename .pdm to final filename (matches concurrent engine convention)
-        crate::engine::file_io::finalize_file(&cfg.save_path).await
+        if let Some(missing) = length_shortfall(total, expected) {
+            log::error!(
+                "[ProxyDM] single id={} incomplete, missing {missing} bytes",
+                cfg.id
+            );
+            save_progress(total, cfg.id, cfg);
+            return Err(PdmError::Incomplete(format!("{total}/{expected} bytes")));
+        }
+
+        file_io::finalize_file(cfg.id, &cfg.save_path)
+            .await
             .map_err(PdmError::Io)?;
 
         log::info!("[ProxyDM] single id={} done total={} bytes", cfg.id, total);
 
-        // Final progress update so UI reaches 100%
         let _ = self.event_tx.send(Event {
             kind: EventKind::DownloadProgress,
             download_id: cfg.id,

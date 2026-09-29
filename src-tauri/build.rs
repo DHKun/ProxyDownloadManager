@@ -34,7 +34,10 @@ fn main() {
         for (key, value) in obj {
             let const_name = key.to_uppercase();
             let event_name = value.as_str().unwrap_or("");
-            code.push_str(&format!("pub const {}: &str = \"{}\";\n", const_name, event_name));
+            code.push_str(&format!(
+                "pub const {}: &str = \"{}\";\n",
+                const_name, event_name
+            ));
         }
     }
 
@@ -48,7 +51,10 @@ fn main() {
     println!("cargo:rerun-if-changed=events.json");
 
     // Validate frontend copy matches source
-    let frontend_events = Path::new(&manifest_dir).parent().unwrap().join("src/constants/events.json");
+    let frontend_events = Path::new(&manifest_dir)
+        .parent()
+        .unwrap()
+        .join("src/constants/events.json");
     if let Ok(frontend_content) = fs::read_to_string(&frontend_events) {
         if frontend_content.trim() != content.trim() {
             panic!(

@@ -1,10 +1,10 @@
-use crate::network::pool::NetworkPool;
-use crate::network::limiter::MultiLimiter;
 use crate::engine::chunk::{self, ChunkQueue};
 use crate::engine::file_io::{create_output_file, finalize_file};
 use crate::engine::part_progress::{encode_progress_data, PartProgressTracker, PartRange};
 use crate::engine::task_download::{download_task, TaskResult};
-use crate::types::{Event, EventKind, EngineConfig, PdmError, PdmResult};
+use crate::network::limiter::MultiLimiter;
+use crate::network::pool::NetworkPool;
+use crate::types::{EngineConfig, Event, EventKind, PdmError, PdmResult};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -19,10 +19,19 @@ impl ConcurrentDownloader {
         Self { pool, event_tx }
     }
 
-    pub async fn download(&self, cfg: &EngineConfig, limiter: Arc<MultiLimiter>, cancel: Arc<AtomicBool>, on_resume: &crate::engine::OnResumeState) -> PdmResult<()> {
+    pub async fn download(
+        &self,
+        cfg: &EngineConfig,
+        limiter: Arc<MultiLimiter>,
+        cancel: Arc<AtomicBool>,
+        on_resume: &crate::engine::OnResumeState,
+    ) -> PdmResult<()> {
         let part_ranges: Vec<PartRange> = if cfg.part_ranges.is_empty() {
             if cfg.total_size > 0 {
-                vec![PartRange { start: 0, end: cfg.total_size }]
+                vec![PartRange {
+                    start: 0,
+                    end: cfg.total_size,
+                }]
             } else {
                 vec![]
             }
@@ -45,7 +54,10 @@ impl ConcurrentDownloader {
             );
             (cfg.resume_tasks.clone(), cfg.downloaded)
         } else {
-            (chunk::compute_chunks(cfg.total_size, cfg.connections.max(1), 0), 0)
+            (
+                chunk::compute_chunks(cfg.total_size, cfg.connections.max(1), 0),
+                0,
+            )
         };
         let bytes_written = Arc::new(AtomicU64::new(resume_offset));
 
@@ -71,20 +83,37 @@ impl ConcurrentDownloader {
         if tasks.is_empty() {
             // Incomplete → the degrade whitelist lets Single try instead
             // (e.g. range-capable server with unknown size plans no chunks).
-            return Err(PdmError::Incomplete(format!("no tasks planned for id={}", cfg.id)));
+            return Err(PdmError::Incomplete(format!(
+                "no tasks planned for id={}",
+                cfg.id
+            )));
         }
 
         let num_workers = num_conns.min(tasks.len() as u32).max(1);
-        log::info!("[ProxyDM] concurrent id={} workers={} chunks={} total_size={} is_resume={}",
-            cfg.id, num_workers, tasks.len(), cfg.total_size, cfg.is_resume);
+        log::info!(
+            "[ProxyDM] concurrent id={} workers={} chunks={} total_size={} is_resume={}",
+            cfg.id,
+            num_workers,
+            tasks.len(),
+            cfg.total_size,
+            cfg.is_resume
+        );
 
         let queue = Arc::new(ChunkQueue::new(tasks));
 
-        let file = create_output_file(&cfg.save_path, cfg.total_size).await?;
+        let file = create_output_file(cfg.id, &cfg.save_path, cfg.total_size).await?;
         let file = Arc::new(file);
-        log::info!("[ProxyDM] concurrent id={} file created: {}.pdm", cfg.id, cfg.save_path);
+        log::debug!(
+            "[ProxyDM] concurrent id={} temp={}",
+            cfg.id,
+            crate::engine::file_io::temp_path(cfg.id)
+        );
 
-        let client = self.pool.get_client(if cfg.proxy_url.is_empty() { None } else { Some(&cfg.proxy_url) })?;
+        let client = self.pool.get_client(if cfg.proxy_url.is_empty() {
+            None
+        } else {
+            Some(&cfg.proxy_url)
+        })?;
 
         let mut handles = Vec::new();
         let download_id = cfg.id;
@@ -117,15 +146,26 @@ impl ConcurrentDownloader {
         let progress_bytes = bytes_written.clone();
         let progress_parts = parts_tracker.clone();
         let reporter_handle = tokio::spawn(async move {
+            let mut last_bytes = u64::MAX;
+            let mut last_parts: u64 = u64::MAX;
             loop {
-                if progress_cancel.load(Ordering::Relaxed) { break; }
+                if progress_cancel.load(Ordering::Relaxed) {
+                    break;
+                }
                 let size = progress_bytes.load(Ordering::Relaxed);
                 let part_snap = progress_parts.snapshot();
-                let _ = progress_tx.send(Event {
-                    kind: EventKind::DownloadProgress,
-                    download_id,
-                    data: Some(encode_progress_data(size, &part_snap, false)),
-                });
+                let parts_hash = part_snap
+                    .iter()
+                    .fold(0u64, |acc, n| acc.wrapping_mul(31).wrapping_add(*n));
+                if size != last_bytes || parts_hash != last_parts {
+                    last_bytes = size;
+                    last_parts = parts_hash;
+                    let _ = progress_tx.send(Event {
+                        kind: EventKind::DownloadProgress,
+                        download_id,
+                        data: Some(encode_progress_data(size, &part_snap, false)),
+                    });
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
         });
@@ -137,242 +177,72 @@ impl ConcurrentDownloader {
             .unwrap_or_else(|| std::sync::Arc::new(AtomicU32::new(num_workers)));
         let live_workers = std::sync::Arc::new(AtomicU32::new(0));
 
-        // Spawn workers
+        let make_worker = || ChunkWorker {
+            queue: queue.clone(),
+            file: file.clone(),
+            client: client.clone(),
+            stop: stop.clone(),
+            abort_reason: abort_reason.clone(),
+            limiter: limiter.clone(),
+            url: cfg.url.clone(),
+            max_retries: cfg.max_retries,
+            user_agent: cfg.user_agent.clone(),
+            bytes_written: bytes_written.clone(),
+            parts: parts_tracker.clone(),
+            headers: headers.clone(),
+            desired: desired.clone(),
+            live_workers: live_workers.clone(),
+            event_tx: self.event_tx.clone(),
+            download_id,
+            expected_total: cfg.total_size,
+        };
+
         for _worker_id in 0..num_workers {
-            let queue = queue.clone();
-            let file = file.clone();
-            let client = client.clone();
-            let stop = stop.clone();
-            let abort_reason = abort_reason.clone();
-            let limiter = limiter.clone();
-            let url = cfg.url.clone();
-            let max_retries = cfg.max_retries;
-            let user_agent = cfg.user_agent.clone();
-            let stop_for_task = stop.clone();
-            let bytes_written = bytes_written.clone();
-            let parts = parts_tracker.clone();
-            let headers = headers.clone();
-            let desired = desired.clone();
-            let live_workers = live_workers.clone();
-            live_workers.fetch_add(1, Ordering::Relaxed);
-
-            // On any abort the popped task goes back into the queue first, so
-            // the drain-based resume snapshot always covers remaining work.
-            let abort = move |queue: &ChunkQueue,
-                              task: crate::types::Task,
-                              reason: PdmError,
-                              stop: &AtomicBool,
-                              abort_reason: &std::sync::Mutex<Option<PdmError>>| {
-                queue.push(task);
-                if let Ok(mut guard) = abort_reason.lock() {
-                    if guard.is_none() {
-                        *guard = Some(reason);
-                    }
-                }
-                stop.store(true, Ordering::Relaxed);
-            };
-
-            let handle = tokio::spawn(async move {
-                let mut retries_left = max_retries;
-                loop {
-                    if stop.load(Ordering::Relaxed) {
-                        live_workers.fetch_sub(1, Ordering::Relaxed);
-                        return;
-                    }
-                    if live_workers.load(Ordering::Relaxed) > desired.load(Ordering::Relaxed).max(1) {
-                        live_workers.fetch_sub(1, Ordering::Relaxed);
-                        return;
-                    }
-                    let task = match queue.pop_or_steal() {
-                        Some(t) => t,
-                        None => {
-                            if let Some(stolen) = queue.split_largest(2 * 1024 * 1024) {
-                                stolen
-                            } else {
-                                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-                                if queue.is_empty() {
-                                    live_workers.fetch_sub(1, Ordering::Relaxed);
-                                    return;
-                                }
-                                continue;
-                            }
-                        }
-                    };
-
-                    let result = download_task(
-                        &url, &client, &*file, &task, &stop_for_task, &limiter, &user_agent, &bytes_written,
-                        Some(parts.clone()),
-                        headers.as_ref(),
-                    ).await;
-
-                    match result {
-                        TaskResult::Complete => {
-                            retries_left = max_retries;
-                        }
-                        TaskResult::Partial { remaining } => {
-                            log::info!("[ProxyDM] task offset={} partial, re-queueing {} bytes", task.offset, remaining.length);
-                            queue.push(remaining);
-                            retries_left = max_retries;
-                        }
-                        TaskResult::Cancelled => {
-                            live_workers.fetch_sub(1, Ordering::Relaxed);
-                            return;
-                        }
-                        TaskResult::RangeNotSupported => {
-                            abort(&queue, task, PdmError::RangeLost, &stop, &abort_reason);
-                            live_workers.fetch_sub(1, Ordering::Relaxed);
-                            return;
-                        }
-                        TaskResult::FatalNoRetry(msg) => {
-                            abort(&queue, task, PdmError::Http(
-                                msg.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(403)
-                            ), &stop, &abort_reason);
-                            live_workers.fetch_sub(1, Ordering::Relaxed);
-                            return;
-                        }
-                        TaskResult::Fatal(msg) => {
-                            if retries_left == 0 {
-                                log::error!("retries exhausted for offset={}, stopping", task.offset);
-                                abort(
-                                    &queue,
-                                    task,
-                                    PdmError::RetriesExhausted(msg),
-                                    &stop,
-                                    &abort_reason,
-                                );
-                                live_workers.fetch_sub(1, Ordering::Relaxed);
-                                return;
-                            }
-                            retries_left -= 1;
-                            queue.push(task);
-                            let attempt = max_retries - retries_left;
-                            let delay = crate::retry::backoff_delay(attempt);
-                            let deadline = std::time::Instant::now() + delay;
-                            while std::time::Instant::now() < deadline {
-                                if stop.load(Ordering::Relaxed) {
-                                    live_workers.fetch_sub(1, Ordering::Relaxed);
-                                    return;
-                                }
-                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                            }
-                        }
-                    }
-                }
-            });
-            handles.push(handle);
+            handles.push(spawn_chunk_worker(make_worker()));
         }
 
-        // Scale-up watcher: extra workers join the same queue without restarting the download.
-        {
-            let queue = queue.clone();
-            let file = file.clone();
-            let client = client.clone();
+        // Scale-up watcher: extra workers join the same queue and the same loop.
+        // JoinHandles are retained so finalize cannot race a writer that is
+        // still appending to the temp file.
+        let extra_handles: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let accept_scale = Arc::new(AtomicBool::new(true));
+        let scale_handle = {
             let stop = stop.clone();
-            let abort_reason = abort_reason.clone();
-            let limiter = limiter.clone();
-            let url = cfg.url.clone();
-            let max_retries = cfg.max_retries;
-            let user_agent = cfg.user_agent.clone();
-            let bytes_written = bytes_written.clone();
-            let parts = parts_tracker.clone();
-            let headers = headers.clone();
             let desired = desired.clone();
             let live_workers = live_workers.clone();
-            let scale_handle = tokio::spawn(async move {
-                while !stop.load(Ordering::Relaxed) {
-                    let want = desired.load(Ordering::Relaxed).min(chunk::MAX_CONNECTIONS).max(1);
+            let prototype = make_worker();
+            let extra_handles = extra_handles.clone();
+            let accept_scale = accept_scale.clone();
+            tokio::spawn(async move {
+                while accept_scale.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
+                    let want = desired
+                        .load(Ordering::Relaxed)
+                        .min(chunk::MAX_CONNECTIONS)
+                        .max(1);
                     let have = live_workers.load(Ordering::Relaxed);
                     if want > have {
-                        live_workers.fetch_add(1, Ordering::Relaxed);
-                        let queue = queue.clone();
-                        let file = file.clone();
-                        let client = client.clone();
-                        let stop = stop.clone();
-                        let abort_reason = abort_reason.clone();
-                        let limiter = limiter.clone();
-                        let url = url.clone();
-                        let user_agent = user_agent.clone();
-                        let bytes_written = bytes_written.clone();
-                        let parts = parts.clone();
-                        let headers = headers.clone();
-                        let desired = desired.clone();
-                        let live_workers = live_workers.clone();
-                        tokio::spawn(async move {
-                            let mut retries_left = max_retries;
-                            loop {
-                                if stop.load(Ordering::Relaxed) {
-                                    live_workers.fetch_sub(1, Ordering::Relaxed);
-                                    return;
-                                }
-                                if live_workers.load(Ordering::Relaxed) > desired.load(Ordering::Relaxed).max(1) {
-                                    live_workers.fetch_sub(1, Ordering::Relaxed);
-                                    return;
-                                }
-                                let task = match queue.pop_or_steal() {
-                                    Some(t) => t,
-                                    None => match queue.split_largest(2 * 1024 * 1024) {
-                                        Some(t) => t,
-                                        None => {
-                                            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-                                            if queue.is_empty() {
-                                                live_workers.fetch_sub(1, Ordering::Relaxed);
-                                                return;
-                                            }
-                                            continue;
-                                        }
-                                    },
-                                };
-                                let result = download_task(
-                                    &url, &client, &*file, &task, &stop, &limiter, &user_agent, &bytes_written,
-                                    Some(parts.clone()),
-                                    headers.as_ref(),
-                                ).await;
-                                match result {
-                                    TaskResult::Complete => retries_left = max_retries,
-                                    TaskResult::Partial { remaining } => queue.push(remaining),
-                                    TaskResult::Cancelled | TaskResult::RangeNotSupported | TaskResult::FatalNoRetry(_) => {
-                                        if matches!(result, TaskResult::RangeNotSupported) {
-                                            queue.push(task);
-                                        }
-                                        live_workers.fetch_sub(1, Ordering::Relaxed);
-                                        return;
-                                    }
-                                    TaskResult::Fatal(msg) => {
-                                        if retries_left == 0 {
-                                            queue.push(task);
-                                            if let Ok(mut g) = abort_reason.lock() {
-                                                if g.is_none() {
-                                                    *g = Some(PdmError::RetriesExhausted(msg));
-                                                }
-                                            }
-                                            stop.store(true, Ordering::Relaxed);
-                                            live_workers.fetch_sub(1, Ordering::Relaxed);
-                                            return;
-                                        }
-                                        retries_left -= 1;
-                                        queue.push(task);
-                                        tokio::time::sleep(crate::retry::backoff_delay(max_retries - retries_left)).await;
-                                    }
-                                }
-                            }
-                        });
+                        let handle = spawn_chunk_worker(prototype.clone());
+                        if let Ok(mut guard) = extra_handles.lock() {
+                            guard.push(handle);
+                        }
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
-            });
-            let _ = scale_handle;
-        }
+            })
+        };
 
         for h in handles {
             let _ = h.await;
         }
-        let wait_deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
-        while live_workers.load(Ordering::Relaxed) > 0
-            && !stop.load(Ordering::Relaxed)
-            && !cancel.load(Ordering::Relaxed)
-            && std::time::Instant::now() < wait_deadline
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        accept_scale.store(false, Ordering::Relaxed);
+        let _ = scale_handle.await;
+        let extras = extra_handles
+            .lock()
+            .map(|mut guard| std::mem::take(&mut *guard))
+            .unwrap_or_default();
+        for h in extras {
+            let _ = h.await;
         }
         log::info!("[ProxyDM] concurrent id={} all workers done", cfg.id);
 
@@ -394,7 +264,7 @@ impl ConcurrentDownloader {
 
         let _ = file.sync_all();
 
-        let mut save_snapshot = || {
+        let save_snapshot = || {
             let saved = crate::types::DownloadState {
                 url: cfg.url.clone(),
                 id: cfg.id,
@@ -422,13 +292,18 @@ impl ConcurrentDownloader {
 
         if !queue.is_empty() || bytes_written.load(Ordering::Relaxed) < cfg.total_size {
             let downloaded = bytes_written.load(Ordering::Relaxed);
-            return Err(PdmError::Incomplete(format!("{}/{} bytes", downloaded, cfg.total_size)));
+            return Err(PdmError::Incomplete(format!(
+                "{}/{} bytes",
+                downloaded, cfg.total_size
+            )));
         }
 
         // Release our handle before the rename — Windows refuses to rename a
         // file that still has an open handle with default share flags.
         drop(file);
-        finalize_file(&cfg.save_path).await?;
+        let _ = std::fs::File::open(crate::engine::file_io::temp_path(cfg.id))
+            .and_then(|f| f.sync_all());
+        finalize_file(cfg.id, &cfg.save_path).await?;
 
         let _ = self.event_tx.send(Event {
             kind: EventKind::DownloadCompleted,
@@ -438,4 +313,182 @@ impl ConcurrentDownloader {
 
         Ok(())
     }
+}
+
+struct ChunkWorker {
+    queue: Arc<ChunkQueue>,
+    file: Arc<std::fs::File>,
+    client: reqwest::Client,
+    stop: Arc<AtomicBool>,
+    abort_reason: Arc<std::sync::Mutex<Option<PdmError>>>,
+    limiter: Arc<MultiLimiter>,
+    url: String,
+    max_retries: u32,
+    user_agent: String,
+    bytes_written: Arc<AtomicU64>,
+    parts: Arc<PartProgressTracker>,
+    headers: Arc<std::collections::HashMap<String, String>>,
+    desired: Arc<AtomicU32>,
+    live_workers: Arc<AtomicU32>,
+    event_tx: mpsc::UnboundedSender<Event>,
+    download_id: u64,
+    expected_total: u64,
+}
+
+impl Clone for ChunkWorker {
+    fn clone(&self) -> Self {
+        Self {
+            queue: self.queue.clone(),
+            file: self.file.clone(),
+            client: self.client.clone(),
+            stop: self.stop.clone(),
+            abort_reason: self.abort_reason.clone(),
+            limiter: self.limiter.clone(),
+            url: self.url.clone(),
+            max_retries: self.max_retries,
+            user_agent: self.user_agent.clone(),
+            bytes_written: self.bytes_written.clone(),
+            parts: self.parts.clone(),
+            headers: self.headers.clone(),
+            desired: self.desired.clone(),
+            live_workers: self.live_workers.clone(),
+            event_tx: self.event_tx.clone(),
+            download_id: self.download_id,
+            expected_total: self.expected_total,
+        }
+    }
+}
+
+fn emit_phase(tx: &mpsc::UnboundedSender<Event>, id: u64, phase: &str) {
+    let _ = tx.send(Event {
+        kind: EventKind::DownloadProgress,
+        download_id: id,
+        data: Some(serde_json::json!({ "phase": phase }).to_string()),
+    });
+}
+
+/// One worker loop for both the initial set and workers added at runtime.
+/// A popped task is pushed back before the worker stops on any failure, so
+/// the resume snapshot cannot lose it.
+fn spawn_chunk_worker(env: ChunkWorker) -> tokio::task::JoinHandle<()> {
+    env.live_workers.fetch_add(1, Ordering::Relaxed);
+    tokio::spawn(async move {
+        let mut retries_left = env.max_retries;
+        let stop_worker = |live: &AtomicU32| {
+            live.fetch_sub(1, Ordering::Relaxed);
+        };
+        let abort = |task: crate::types::Task, reason: PdmError| {
+            env.queue.push(task);
+            if let Ok(mut guard) = env.abort_reason.lock() {
+                if guard.is_none() {
+                    *guard = Some(reason);
+                }
+            }
+            env.stop.store(true, Ordering::Relaxed);
+        };
+        loop {
+            if env.stop.load(Ordering::Relaxed) {
+                stop_worker(&env.live_workers);
+                return;
+            }
+            if env.live_workers.load(Ordering::Relaxed) > env.desired.load(Ordering::Relaxed).max(1)
+            {
+                stop_worker(&env.live_workers);
+                return;
+            }
+            let task = match env.queue.pop_or_steal() {
+                Some(t) => t,
+                None => match env.queue.split_largest(2 * 1024 * 1024) {
+                    Some(t) => t,
+                    None => {
+                        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                        if env.queue.is_empty() {
+                            stop_worker(&env.live_workers);
+                            return;
+                        }
+                        continue;
+                    }
+                },
+            };
+            log::debug!(
+                "[ProxyDM] worker pop id={} offset={}",
+                env.download_id,
+                task.offset
+            );
+
+            let result = download_task(
+                &env.url,
+                &env.client,
+                &env.file,
+                &task,
+                &env.stop,
+                &env.limiter,
+                &env.user_agent,
+                &env.bytes_written,
+                Some(env.parts.clone()),
+                env.headers.as_ref(),
+                env.expected_total,
+            )
+            .await;
+
+            match result {
+                TaskResult::Complete => {
+                    retries_left = env.max_retries;
+                }
+                TaskResult::Partial { remaining } => {
+                    log::debug!(
+                        "[ProxyDM] task offset={} partial, re-queueing {} bytes",
+                        task.offset,
+                        remaining.length
+                    );
+                    env.queue.push(remaining);
+                    retries_left = env.max_retries;
+                }
+                TaskResult::Cancelled => {
+                    // download_task returns Cancelled only after the popped
+                    // range is fully on disk. A partial cancel comes back as
+                    // Partial and was re-queued above.
+                    stop_worker(&env.live_workers);
+                    return;
+                }
+                TaskResult::RangeNotSupported | TaskResult::InvalidRangeResponse => {
+                    abort(task, PdmError::RangeLost);
+                    stop_worker(&env.live_workers);
+                    return;
+                }
+                TaskResult::FatalNoRetry(msg) => {
+                    let code = msg
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(403);
+                    abort(task, PdmError::Http(code));
+                    stop_worker(&env.live_workers);
+                    return;
+                }
+                TaskResult::Fatal(msg) => {
+                    if retries_left == 0 {
+                        log::error!("retries exhausted for offset={}, stopping", task.offset);
+                        abort(task, PdmError::RetriesExhausted(msg));
+                        stop_worker(&env.live_workers);
+                        return;
+                    }
+                    retries_left -= 1;
+                    env.queue.push(task);
+                    emit_phase(&env.event_tx, env.download_id, "retrying");
+                    let attempt = env.max_retries - retries_left;
+                    let delay = crate::retry::backoff_delay(attempt);
+                    let deadline = std::time::Instant::now() + delay;
+                    while std::time::Instant::now() < deadline {
+                        if env.stop.load(Ordering::Relaxed) {
+                            stop_worker(&env.live_workers);
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    emit_phase(&env.event_tx, env.download_id, "downloading");
+                }
+            }
+        }
+    })
 }

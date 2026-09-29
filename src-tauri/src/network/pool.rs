@@ -1,8 +1,8 @@
+use crate::types::{PdmError, PdmResult};
+use reqwest::Proxy;
 use std::collections::HashMap;
 use std::sync::Mutex;
-use reqwest::Proxy;
 use std::time::Duration;
-use crate::types::{PdmError, PdmResult};
 
 pub struct NetworkPool {
     clients: Mutex<HashMap<String, reqwest::Client>>,
@@ -19,11 +19,17 @@ impl NetworkPool {
 
     pub fn get_client(&self, proxy_url: Option<&str>) -> PdmResult<reqwest::Client> {
         let key = proxy_url.unwrap_or("direct").to_string();
-        let mut map = self.clients.lock().map_err(|e| PdmError::Other(e.to_string()))?;
+        let mut map = self
+            .clients
+            .lock()
+            .map_err(|e| PdmError::Other(e.to_string()))?;
         if let Some(client) = map.get(&key) {
             return Ok(client.clone());
         }
-        log::info!("[ProxyDM] pool creating new client for proxy={}", crate::headers::redact_log(&key));
+        log::info!(
+            "[ProxyDM] pool creating new client for proxy={}",
+            crate::headers::redact_log(&key)
+        );
         let mut builder = reqwest::Client::builder()
             .pool_max_idle_per_host(128)
             .tcp_keepalive(Some(Duration::from_secs(60)))
@@ -33,12 +39,17 @@ impl NetworkPool {
 
         if let Some(proxy_str) = proxy_url {
             if let Ok(proxy) = Proxy::all(proxy_str) {
-                log::info!("[ProxyDM] pool applying proxy: {}", crate::headers::redact_log(proxy_str));
+                log::info!(
+                    "[ProxyDM] pool applying proxy: {}",
+                    crate::headers::redact_log(proxy_str)
+                );
                 builder = builder.proxy(proxy);
             }
         }
 
-        let client = builder.build().map_err(|e| PdmError::ClientBuild(e.to_string()))?;
+        let client = builder
+            .build()
+            .map_err(|e| PdmError::ClientBuild(e.to_string()))?;
         map.insert(key, client.clone());
         Ok(client)
     }

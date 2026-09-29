@@ -7,9 +7,11 @@ pub enum EventAction {
     /// Update runtime progress (id, downloaded_bytes, optional per-part bytes, reset map to single part).
     UpdateProgress {
         id: u64,
-        downloaded: u64,
+        downloaded: Option<u64>,
         part_downloaded: Option<Vec<u64>>,
         reset_to_single: bool,
+        total: Option<u64>,
+        phase: Option<String>,
     },
     /// Download started: seed runtime + emit frontend event.
     DownloadStarted(u64),
@@ -24,9 +26,12 @@ pub enum EventAction {
 /// Parsed progress payload from engine (plain number or JSON).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProgressPayload {
-    pub downloaded: u64,
+    pub downloaded: Option<u64>,
     pub part_downloaded: Option<Vec<u64>>,
     pub reset_to_single: bool,
+    pub total: Option<u64>,
+    /// "retrying" | "merging" | "downloading" | "connecting"
+    pub phase: Option<String>,
 }
 
 /// Parse engine progress `data` string.
@@ -38,29 +43,35 @@ pub fn parse_progress_data(data: &str) -> Option<ProgressPayload> {
     // Legacy: plain integer
     if let Ok(downloaded) = trimmed.parse::<u64>() {
         return Some(ProgressPayload {
-            downloaded,
+            downloaded: Some(downloaded),
             part_downloaded: None,
             reset_to_single: false,
+            total: None,
+            phase: None,
         });
     }
-    // JSON: {"downloaded":N,"parts":[...],"reset_to_single":bool}
+    // JSON: {"downloaded":N,"parts":[...],"reset_to_single":bool,"total":N,"phase":"..."}
     let v: serde_json::Value = serde_json::from_str(trimmed).ok()?;
-    let downloaded = v.get("downloaded")?.as_u64()?;
+    let downloaded = v.get("downloaded").and_then(|x| x.as_u64());
     let part_downloaded = v.get("parts").and_then(|p| {
-        p.as_array().map(|arr| {
-            arr.iter()
-                .filter_map(|x| x.as_u64())
-                .collect::<Vec<_>>()
-        })
+        p.as_array()
+            .map(|arr| arr.iter().filter_map(|x| x.as_u64()).collect::<Vec<_>>())
     });
     let reset_to_single = v
         .get("reset_to_single")
         .and_then(|x| x.as_bool())
         .unwrap_or(false);
+    let total = v.get("total").and_then(|x| x.as_u64());
+    let phase = v.get("phase").and_then(|x| x.as_str()).map(str::to_string);
+    if downloaded.is_none() && phase.is_none() && total.is_none() {
+        return None;
+    }
     Some(ProgressPayload {
         downloaded,
         part_downloaded,
         reset_to_single,
+        total,
+        phase,
     })
 }
 
@@ -84,6 +95,8 @@ pub fn transform_event(event: &Event) -> EventAction {
                         downloaded: p.downloaded,
                         part_downloaded: p.part_downloaded,
                         reset_to_single: p.reset_to_single,
+                        total: p.total,
+                        phase: p.phase,
                     };
                 }
             }
@@ -119,22 +132,33 @@ mod tests {
 
     #[test]
     fn test_errored_event() {
-        let action = transform_event(&make_event(EventKind::DownloadErrored, 3,
-            Some("timeout".to_string())));
-        assert_eq!(action, EventAction::DownloadErrored(3, "timeout".to_string()));
+        let action = transform_event(&make_event(
+            EventKind::DownloadErrored,
+            3,
+            Some("timeout".to_string()),
+        ));
+        assert_eq!(
+            action,
+            EventAction::DownloadErrored(3, "timeout".to_string())
+        );
     }
 
     #[test]
     fn test_progress_event_plain() {
-        let action = transform_event(&make_event(EventKind::DownloadProgress, 4,
-            Some("1024".to_string())));
+        let action = transform_event(&make_event(
+            EventKind::DownloadProgress,
+            4,
+            Some("1024".to_string()),
+        ));
         assert_eq!(
             action,
             EventAction::UpdateProgress {
                 id: 4,
-                downloaded: 1024,
+                downloaded: Some(1024),
                 part_downloaded: None,
                 reset_to_single: false,
+                total: None,
+                phase: None,
             }
         );
     }
@@ -142,14 +166,20 @@ mod tests {
     #[test]
     fn test_progress_event_json() {
         let data = r#"{"downloaded":500,"parts":[100,200,200],"reset_to_single":false}"#;
-        let action = transform_event(&make_event(EventKind::DownloadProgress, 7, Some(data.to_string())));
+        let action = transform_event(&make_event(
+            EventKind::DownloadProgress,
+            7,
+            Some(data.to_string()),
+        ));
         assert_eq!(
             action,
             EventAction::UpdateProgress {
                 id: 7,
-                downloaded: 500,
+                downloaded: Some(500),
                 part_downloaded: Some(vec![100, 200, 200]),
                 reset_to_single: false,
+                total: None,
+                phase: None,
             }
         );
     }
@@ -157,29 +187,40 @@ mod tests {
     #[test]
     fn test_progress_event_reset_single() {
         let data = r#"{"downloaded":0,"parts":[0],"reset_to_single":true}"#;
-        let action = transform_event(&make_event(EventKind::DownloadProgress, 8, Some(data.to_string())));
+        let action = transform_event(&make_event(
+            EventKind::DownloadProgress,
+            8,
+            Some(data.to_string()),
+        ));
         assert_eq!(
             action,
             EventAction::UpdateProgress {
                 id: 8,
-                downloaded: 0,
+                downloaded: Some(0),
                 part_downloaded: Some(vec![0]),
                 reset_to_single: true,
+                total: None,
+                phase: None,
             }
         );
     }
 
     #[test]
     fn test_progress_bad_data() {
-        let action = transform_event(&make_event(EventKind::DownloadProgress, 5,
-            Some("not-a-number".to_string())));
+        let action = transform_event(&make_event(
+            EventKind::DownloadProgress,
+            5,
+            Some("not-a-number".to_string()),
+        ));
         assert_eq!(action, EventAction::Noop);
     }
 
     #[test]
     fn test_unknown_event_is_noop() {
         // EventKind doesn't have other variants, but future-proof the test
-        assert_eq!(transform_event(&make_event(EventKind::DownloadStarted, 99, None)),
-            EventAction::DownloadStarted(99));
+        assert_eq!(
+            transform_event(&make_event(EventKind::DownloadStarted, 99, None)),
+            EventAction::DownloadStarted(99)
+        );
     }
 }

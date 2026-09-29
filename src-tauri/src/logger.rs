@@ -1,6 +1,6 @@
-use log::{Level, LevelFilter, Log, Metadata, Record, set_logger, set_max_level};
+use log::{set_logger, set_max_level, Level, LevelFilter, Log, Metadata, Record};
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,7 +10,7 @@ static LOGGER: Logger = Logger {
 };
 
 pub struct Logger {
-    file: Mutex<Option<File>>,
+    file: Mutex<Option<BufWriter<File>>>,
 }
 
 impl Logger {
@@ -24,13 +24,19 @@ impl Logger {
             .append(true)
             .open(&path)
             .map_err(|e| e.to_string())?;
-        Ok(Self { file: Mutex::new(Some(file)) })
+        Ok(Self {
+            file: Mutex::new(Some(BufWriter::new(file))),
+        })
     }
 
     fn log_path() -> PathBuf {
-        PathBuf::from(crate::state::gob::state_dir().parent()
-            .unwrap_or(&PathBuf::from("."))
-            .to_path_buf()).join("logs/proxydm.log")
+        PathBuf::from(
+            crate::state::gob::state_dir()
+                .parent()
+                .unwrap_or(&PathBuf::from("."))
+                .to_path_buf(),
+        )
+        .join("logs/proxydm.log")
     }
 
     pub fn log(&self, level: &str, msg: &str) {
@@ -40,17 +46,29 @@ impl Logger {
         let secs = now.as_secs();
         let msg = crate::headers::redact_log(msg);
         let line = format!("[{}] [{}] {}\n", Self::fmt_time(secs), level, msg);
+        self.write_line(level, &line);
+    }
+
+    fn write_line(&self, level: &str, line: &str) {
         if let Ok(mut guard) = self.file.lock() {
             if let Some(ref mut f) = *guard {
                 let _ = f.write_all(line.as_bytes());
-                let _ = f.flush();
+                if level == "ERROR" {
+                    let _ = f.flush();
+                }
             }
         }
     }
 
-    pub fn info(&self, msg: &str) { self.log("INFO", msg); }
-    pub fn warn(&self, msg: &str) { self.log("WARN", msg); }
-    pub fn error(&self, msg: &str) { self.log("ERROR", msg); }
+    pub fn info(&self, msg: &str) {
+        self.log("INFO", msg);
+    }
+    pub fn warn(&self, msg: &str) {
+        self.log("WARN", msg);
+    }
+    pub fn error(&self, msg: &str) {
+        self.log("ERROR", msg);
+    }
 
     fn fmt_time(secs: u64) -> String {
         let remaining = secs % 86400;
@@ -64,7 +82,9 @@ impl Logger {
 
         loop {
             let days_in_year = if is_leap(y) { 366 } else { 365 };
-            if remaining_days < days_in_year { break; }
+            if remaining_days < days_in_year {
+                break;
+            }
             remaining_days -= days_in_year;
             y += 1;
         }
@@ -77,21 +97,34 @@ impl Logger {
 
         let mut m = 0;
         for &days_in_m in &month_days {
-            if remaining_days < days_in_m { break; }
+            if remaining_days < days_in_m {
+                break;
+            }
             remaining_days -= days_in_m;
             m += 1;
         }
 
-        format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-            y, m + 1, remaining_days + 1, hours, minutes, seconds)
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            y,
+            m + 1,
+            remaining_days + 1,
+            hours,
+            minutes,
+            seconds
+        )
     }
 }
 
 impl Log for Logger {
-    fn enabled(&self, _metadata: &Metadata) -> bool { true }
+    fn enabled(&self, _metadata: &Metadata) -> bool {
+        true
+    }
 
     fn log(&self, record: &Record) {
-        if !self.enabled(record.metadata()) { return; }
+        if !self.enabled(record.metadata()) {
+            return;
+        }
         let level = match record.level() {
             Level::Error => "ERROR",
             Level::Warn => "WARN",
@@ -104,16 +137,14 @@ impl Log for Logger {
             .unwrap_or_default();
         let secs = now.as_secs();
         let msg = crate::headers::redact_log(&record.args().to_string());
-        let line = format!("[{}] [{}] [{}] {}\n",
-            Logger::fmt_time(secs), level,
+        let line = format!(
+            "[{}] [{}] [{}] {}\n",
+            Logger::fmt_time(secs),
+            level,
             record.module_path().unwrap_or("?"),
-            msg);
-        if let Ok(mut guard) = self.file.lock() {
-            if let Some(ref mut f) = *guard {
-                let _ = f.write_all(line.as_bytes());
-                let _ = f.flush();
-            }
-        }
+            msg
+        );
+        self.write_line(level, &line);
     }
 
     fn flush(&self) {
@@ -133,13 +164,14 @@ pub fn init_log() {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Ok(file) = OpenOptions::new().create(true).append(true).open(&path) {
-        // We need to set the file in the static LOGGER. Since LOGGER.file is Mutex<Option<File>>,
-        // we can set it here.
         if let Ok(mut guard) = LOGGER.file.lock() {
-            *guard = Some(file);
+            *guard = Some(BufWriter::new(file));
         }
     }
     let _ = set_logger(&LOGGER);
+    #[cfg(debug_assertions)]
+    set_max_level(LevelFilter::Debug);
+    #[cfg(not(debug_assertions))]
     set_max_level(LevelFilter::Info);
 }
 
@@ -157,7 +189,12 @@ pub fn read_logs(max_lines: usize) -> Result<Vec<String>, String> {
         return Ok(Vec::new());
     }
     let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let lines: Vec<String> = content.lines().rev().take(max_lines).map(|l| l.to_string()).collect();
+    let lines: Vec<String> = content
+        .lines()
+        .rev()
+        .take(max_lines)
+        .map(|l| l.to_string())
+        .collect();
     Ok(lines)
 }
 
@@ -180,7 +217,12 @@ mod tests {
     #[test]
     fn test_log_path_ends_correctly() {
         let path = log_path_str();
-        assert!(path.ends_with("proxydm.log"));
-        assert!(path.contains(".ProxyDM"));
+        // Tests pin the home directory to a temp dir, so the path is
+        // `{test-home}/logs/proxydm.log` rather than ~/.ProxyDM.
+        assert!(
+            path.ends_with("logs/proxydm.log") || path.ends_with("logs\\proxydm.log"),
+            "{path}"
+        );
+        assert!(path.contains("pdm_test_home_"), "{path}");
     }
 }

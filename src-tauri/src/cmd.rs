@@ -1,10 +1,10 @@
-use crate::types::*;
 use crate::download_manager::DownloadManager;
 use crate::event_bus::EventBus;
 use crate::icons::{IconCache, IconData};
-use crate::services::settings_service::SettingsService;
 use crate::services::network_service::NetworkService;
+use crate::services::settings_service::SettingsService;
 use crate::state::ledger::ProgressLedger;
+use crate::types::*;
 use std::sync::Arc;
 use tauri::State;
 
@@ -60,7 +60,11 @@ pub async fn probe_url(
 ) -> Result<ProbeInfo, PdmError> {
     state
         .dm
-        .probe_url(url, headers.unwrap_or_default(), proxy_name.unwrap_or_default())
+        .probe_url(
+            url,
+            headers.unwrap_or_default(),
+            proxy_name.unwrap_or_default(),
+        )
         .await
 }
 
@@ -149,8 +153,13 @@ pub fn get_settings(state: State<'_, Arc<AppState>>) -> Result<Settings, PdmErro
 
 #[tauri::command]
 pub fn save_settings(state: State<'_, Arc<AppState>>, settings: Settings) -> Result<(), PdmError> {
-    log::info!("[ProxyDM] save_settings lang={} dl_dir={} max_conns={} tls_invalid={}",
-        settings.language, settings.download_dir, settings.max_connections, settings.danger_accept_invalid_certs);
+    log::info!(
+        "[ProxyDM] save_settings lang={} dl_dir={} max_conns={} tls_invalid={}",
+        settings.language,
+        settings.download_dir,
+        settings.max_connections,
+        settings.danger_accept_invalid_certs
+    );
 
     let result = state.settings.save(&settings)?;
     state.dm.set_global_rate_limit(settings.global_rate_limit);
@@ -159,7 +168,11 @@ pub fn save_settings(state: State<'_, Arc<AppState>>, settings: Settings) -> Res
         state.dm.clear_client_pool();
     }
 
-    if let Err(e) = crate::platform::sync_autostart(&state.app_handle, result.launch_at_startup, result.silent_startup) {
+    if let Err(e) = crate::platform::sync_autostart(
+        &state.app_handle,
+        result.launch_at_startup,
+        result.silent_startup,
+    ) {
         log::error!("[ProxyDM] Failed to sync autostart: {}", e);
     }
 
@@ -168,7 +181,9 @@ pub fn save_settings(state: State<'_, Arc<AppState>>, settings: Settings) -> Res
         use tauri_plugin_global_shortcut::GlobalShortcutExt;
         let app = &state.app_handle;
         if !result.old_shortcut.is_empty() {
-            let _ = app.global_shortcut().unregister(result.old_shortcut.as_str());
+            let _ = app
+                .global_shortcut()
+                .unregister(result.old_shortcut.as_str());
         }
         if !result.new_shortcut.is_empty() {
             if let Err(e) = app.global_shortcut().register(result.new_shortcut.as_str()) {
@@ -184,6 +199,7 @@ pub fn save_settings(state: State<'_, Arc<AppState>>, settings: Settings) -> Res
 #[tauri::command]
 pub fn exit_app(app: tauri::AppHandle) {
     log::info!("[ProxyDM] exit_app called");
+    log::logger().flush();
     app.exit(0);
 }
 
@@ -198,10 +214,7 @@ pub fn file_exists(path: String) -> bool {
 }
 
 #[tauri::command]
-pub fn get_file_icon(
-    icon_cache: State<'_, IconCache>,
-    file_name: String,
-) -> IconData {
+pub fn get_file_icon(icon_cache: State<'_, IconCache>, file_name: String) -> IconData {
     icon_cache.get(&file_name)
 }
 

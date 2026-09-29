@@ -1,4 +1,4 @@
-use crate::types::{Task, DownloadPart, PartStatus, PdmError, PdmResult};
+use crate::types::{DownloadPart, PartStatus, PdmError, PdmResult, Task};
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
@@ -16,16 +16,19 @@ fn dynamic_chunk_size(file_size: u64, connections: u32) -> u64 {
     let conns = connections.max(1);
     let target = file_size / (conns as u64 * 20); // ~20 chunks/worker
     target
-        .max(4 * 1024 * 1024)    // min 4MB
-        .min(64 * 1024 * 1024)   // max 64MB
+        .max(4 * 1024 * 1024) // min 4MB
+        .min(64 * 1024 * 1024) // max 64MB
 }
 
 pub fn compute_chunks(file_size: u64, num_chunks: u32, _min_chunk_size: u64) -> Vec<Task> {
     if num_chunks == 0 {
-        return vec![Task { offset: 0, length: file_size }];
+        return vec![Task {
+            offset: 0,
+            length: file_size,
+        }];
     }
-    let chunk_size = dynamic_chunk_size(file_size, num_chunks)
-        .max(align_up(file_size / num_chunks as u64));
+    let chunk_size =
+        dynamic_chunk_size(file_size, num_chunks).max(align_up(file_size / num_chunks as u64));
     let chunk_size = align_up(chunk_size);
 
     let mut tasks = Vec::new();
@@ -58,18 +61,26 @@ pub fn plan_chunks(
     let connections = compute_connection_count(file_size, requested_connections, max_connections);
 
     let parts = if supports_range && file_size > 0 {
-        let num_conns = if connections > 0 { connections.min(MAX_CONNECTIONS) } else { 1 };
+        let num_conns = if connections > 0 {
+            connections.min(MAX_CONNECTIONS)
+        } else {
+            1
+        };
         let min_chunk = 2u64 * 1024 * 1024;
         let tasks = compute_chunks(file_size, num_conns, min_chunk);
-        tasks.iter().enumerate().map(|(i, t)| DownloadPart {
-            index: i as u32,
-            start: t.offset,
-            end: t.offset + t.length,
-            downloaded: 0,
-            temp_path: String::new(),
-            status: PartStatus::Pending,
-            retries: 0,
-        }).collect()
+        tasks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| DownloadPart {
+                index: i as u32,
+                start: t.offset,
+                end: t.offset + t.length,
+                downloaded: 0,
+                temp_path: String::new(),
+                status: PartStatus::Pending,
+                retries: 0,
+            })
+            .collect()
     } else {
         vec![DownloadPart {
             index: 0,
@@ -118,13 +129,14 @@ pub fn auto_connections(file_size: u64) -> u32 {
 /// Check if there's enough disk space for the download.
 pub fn check_disk_space(path: &str, file_size: u64) -> PdmResult<()> {
     if file_size > 0 {
-        let pdm_path = crate::engine::file_io::pdm_path(path);
-        if let Some(parent) = std::path::Path::new(&pdm_path).parent() {
+        let save = std::path::Path::new(path);
+        if let Some(parent) = save.parent() {
             if let Ok(available) = fs2::available_space(parent) {
                 let needed = file_size + (2u64 * 1024 * 1024);
                 if available < needed {
                     return Err(PdmError::Other(format!(
-                        "Insufficient disk space: need {}, available {}", needed, available
+                        "Insufficient disk space: need {}, available {}",
+                        needed, available
                     )));
                 }
             }
@@ -169,7 +181,8 @@ impl ChunkQueue {
     }
 
     pub fn remaining_bytes(&self) -> u64 {
-        self.tasks.lock()
+        self.tasks
+            .lock()
             .map(|t| t.iter().map(|task| task.length).sum())
             .unwrap_or(0)
     }
@@ -270,8 +283,14 @@ mod tests {
     #[test]
     fn test_chunk_queue_basic_ops() {
         let tasks = vec![
-            Task { offset: 0, length: 100 },
-            Task { offset: 100, length: 200 },
+            Task {
+                offset: 0,
+                length: 100,
+            },
+            Task {
+                offset: 100,
+                length: 200,
+            },
         ];
         let q = ChunkQueue::new(tasks);
         assert_eq!(q.len(), 2);
@@ -282,7 +301,10 @@ mod tests {
         assert_eq!(t.offset, 0);
         assert_eq!(q.len(), 1);
 
-        q.push(Task { offset: 300, length: 50 });
+        q.push(Task {
+            offset: 300,
+            length: 50,
+        });
         assert_eq!(q.len(), 2);
 
         let drained = q.drain();
@@ -310,7 +332,10 @@ mod tests {
     #[test]
     fn requested_connections_honor_64() {
         assert_eq!(compute_connection_count(10 * 1024 * 1024 * 1024, 64, 0), 64);
-        assert_eq!(compute_connection_count(10 * 1024 * 1024 * 1024, 64, 32), 32);
+        assert_eq!(
+            compute_connection_count(10 * 1024 * 1024 * 1024, 64, 32),
+            32
+        );
         assert_eq!(compute_connection_count(1024, 0, 0), 1);
         assert_eq!(compute_connection_count(8 * 1024 * 1024, 0, 0), 4);
     }

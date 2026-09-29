@@ -54,7 +54,8 @@ pub struct Db {
 
 impl Db {
     fn db_path() -> PathBuf {
-        let home = crate::state::gob::state_dir().parent()
+        let home = crate::state::gob::state_dir()
+            .parent()
             .unwrap_or(&std::path::PathBuf::from("."))
             .to_path_buf();
         home.join("state/downloads.db")
@@ -109,7 +110,9 @@ impl Db {
     pub fn max_id(&self) -> PdmResult<u64> {
         let conn = self.conn.lock().map_err(PdmError::from)?;
         let max: u64 = conn
-            .query_row("SELECT COALESCE(MAX(id), 0) FROM downloads", [], |row| row.get(0))
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM downloads", [], |row| {
+                row.get(0)
+            })
             .map_err(PdmError::from)?;
         Ok(max)
     }
@@ -179,7 +182,9 @@ impl Db {
             .prepare(&format!("SELECT {} FROM downloads WHERE id=?1", COLUMNS))
             .map_err(PdmError::from)?;
 
-        let mut rows = stmt.query_map(params![id], |row| row_to_item(row)).map_err(PdmError::from)?;
+        let mut rows = stmt
+            .query_map(params![id], |row| row_to_item(row))
+            .map_err(PdmError::from)?;
 
         match rows.next() {
             Some(Ok(item)) => Ok(Some(item)),
@@ -426,7 +431,10 @@ mod tests {
 
     fn rand() -> u64 {
         use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
     }
 
     fn sample_item(id: u64) -> DownloadItem {
@@ -518,18 +526,29 @@ mod tests {
             item.status = status.clone();
             db.insert_download(&item).unwrap();
             let items = db.list_downloads().unwrap();
-            assert!(format!("{:?}", items[0].status) == format!("{:?}", status),
-                "Roundtrip failed for {:?}", status);
+            assert!(
+                format!("{:?}", items[0].status) == format!("{:?}", status),
+                "Roundtrip failed for {:?}",
+                status
+            );
         }
     }
 
     #[test]
     fn test_parse_status_handles_edge_cases() {
-        assert!(matches!(parse_status("downloading"), DownloadStatus::Downloading));
+        assert!(matches!(
+            parse_status("downloading"),
+            DownloadStatus::Downloading
+        ));
         assert!(matches!(parse_status("paused"), DownloadStatus::Paused));
-        assert!(matches!(parse_status("completed"), DownloadStatus::Completed));
+        assert!(matches!(
+            parse_status("completed"),
+            DownloadStatus::Completed
+        ));
         assert!(matches!(parse_status("queued"), DownloadStatus::Queued));
-        assert!(matches!(parse_status("failed:timeout"), DownloadStatus::Failed(msg) if msg == "timeout"));
+        assert!(
+            matches!(parse_status("failed:timeout"), DownloadStatus::Failed(msg) if msg == "timeout")
+        );
         assert!(matches!(parse_status("failed:"), DownloadStatus::Failed(msg) if msg == ""));
         assert!(matches!(parse_status("failed"), DownloadStatus::Failed(msg) if msg == ""));
         assert!(matches!(parse_status("unknown"), DownloadStatus::Queued));

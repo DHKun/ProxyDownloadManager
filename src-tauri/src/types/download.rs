@@ -392,9 +392,17 @@ mod tests {
         ];
         for (status, expected_json) in &cases {
             let json = serde_json::to_string(status).unwrap();
-            assert_eq!(json, *expected_json, "Serialization mismatch for {:?}", status);
+            assert_eq!(
+                json, *expected_json,
+                "Serialization mismatch for {:?}",
+                status
+            );
             let back: DownloadStatus = serde_json::from_str(&json).unwrap();
-            assert!(format!("{:?}", back) == format!("{:?}", status), "Deserialization mismatch for {:?}", status);
+            assert!(
+                format!("{:?}", back) == format!("{:?}", status),
+                "Deserialization mismatch for {:?}",
+                status
+            );
         }
         let failed = DownloadStatus::Failed("timeout".to_string());
         let json = serde_json::to_string(&failed).unwrap();

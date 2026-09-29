@@ -1,8 +1,8 @@
-use crate::types::{EngineConfig, PdmResult, Event};
-use crate::engine::EngineHooks;
-use crate::network::pool::NetworkPool;
-use crate::network::limiter::MultiLimiter;
 use crate::engine;
+use crate::engine::EngineHooks;
+use crate::network::limiter::MultiLimiter;
+use crate::network::pool::NetworkPool;
+use crate::types::{EngineConfig, Event, PdmResult};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -54,7 +54,13 @@ pub struct WorkerPool {
 }
 
 impl WorkerPool {
-    pub fn new(max_workers: u32, event_tx: mpsc::UnboundedSender<Event>, danger_accept_invalid_certs: bool, next_id_start: u64, global_rate_limit: u64) -> Self {
+    pub fn new(
+        max_workers: u32,
+        event_tx: mpsc::UnboundedSender<Event>,
+        danger_accept_invalid_certs: bool,
+        next_id_start: u64,
+        global_rate_limit: u64,
+    ) -> Self {
         log::info!("WorkerPool starting next_id from {}", next_id_start);
         Self {
             semaphore: Arc::new(Semaphore::new(max_workers as usize)),
@@ -83,7 +89,12 @@ impl WorkerPool {
 
     /// Submit a download: runs now if a slot is free, otherwise parks it
     /// (Queued 状态机 admission). Idempotent for an id that is already parked.
-    pub async fn add_with_id(&self, cfg: EngineConfig, id: u64, hooks: EngineHooks) -> PdmResult<Admission> {
+    pub async fn add_with_id(
+        &self,
+        cfg: EngineConfig,
+        id: u64,
+        hooks: EngineHooks,
+    ) -> PdmResult<Admission> {
         {
             let pending = self.pending.lock().await;
             if pending.iter().any(|p| p.id == id) {
@@ -104,7 +115,10 @@ impl WorkerPool {
             }
             Err(_) => {
                 log::info!("[ProxyDM] id={} queued (all slots busy)", id);
-                self.pending.lock().await.push_back(PendingDownload { cfg, id, hooks });
+                self.pending
+                    .lock()
+                    .await
+                    .push_back(PendingDownload { cfg, id, hooks });
                 Ok(Admission::Queued)
             }
         }
@@ -121,14 +135,30 @@ impl WorkerPool {
         hooks: EngineHooks,
     ) -> ActiveDownload {
         cfg.id = id;
-        log::info!("[ProxyDM] spawn id={} url={} proxy={} conns={}",
-            id, cfg.url, crate::headers::redact_log(&cfg.proxy_url), cfg.connections);
+        log::info!(
+            "[ProxyDM] spawn id={} url={} proxy={} conns={}",
+            id,
+            cfg.url,
+            crate::headers::redact_log(&cfg.proxy_url),
+            cfg.connections
+        );
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_for_task = cancel.clone();
+        // 0 means Auto: pick from the file size here. Storing 0 in the ledger
+        // keeps the UI on Auto; the live worker still needs a concrete count.
+        let initial = if cfg.connections == 0 {
+            crate::engine::chunk::auto_connections(cfg.total_size)
+                .min(crate::engine::chunk::MAX_CONNECTIONS)
+                .max(1)
+        } else {
+            cfg.connections
+                .min(crate::engine::chunk::MAX_CONNECTIONS)
+                .max(1)
+        };
         let desired = cfg
             .desired_connections
             .clone()
-            .unwrap_or_else(|| Arc::new(AtomicU32::new(cfg.connections.max(1))));
+            .unwrap_or_else(|| Arc::new(AtomicU32::new(initial)));
         cfg.desired_connections = Some(desired.clone());
         let limiter = Arc::new(MultiLimiter::with_global(
             ctx.global_limiter.clone(),
@@ -147,11 +177,20 @@ impl WorkerPool {
             )
             .await;
 
+            // Only this worker may publish an error. A pause removes the entry
+            // and a resume installs a new one; the old task must not overwrite it.
+            let still_ours = {
+                let active = ctx.active.lock().await;
+                active
+                    .get(&id)
+                    .map(|entry| Arc::ptr_eq(&entry.cancel, &cancel_for_task))
+                    .unwrap_or(false)
+            };
             match &result {
                 Ok(_) => log::info!("[ProxyDM] id={} completed OK", id),
                 Err(e) => {
                     log::error!("[ProxyDM] id={} ERROR: {}", id, e);
-                    if !matches!(e, crate::types::PdmError::Cancelled) {
+                    if still_ours && !matches!(e, crate::types::PdmError::Cancelled) {
                         let _ = ctx.event_tx.send(Event {
                             kind: crate::types::EventKind::DownloadErrored,
                             download_id: id,
@@ -170,7 +209,11 @@ impl WorkerPool {
                         active.remove(&id);
                     }
                 }
-                log::info!("[ProxyDM] id={} cleaned up, {} active remaining", id, active.len());
+                log::info!(
+                    "[ProxyDM] id={} cleaned up, {} active remaining",
+                    id,
+                    active.len()
+                );
             }
 
             // FIFO handoff to the next queued download.
@@ -179,8 +222,7 @@ impl WorkerPool {
                 Some(p) => {
                     log::info!("[ProxyDM] slot handoff → queued id={}", p.id);
                     let ctx_next = ctx.clone();
-                    let next_active =
-                        Self::launch(ctx_next.clone(), p.cfg, permit, p.id, p.hooks);
+                    let next_active = Self::launch(ctx_next.clone(), p.cfg, permit, p.id, p.hooks);
                     ctx_next.active.lock().await.insert(p.id, next_active);
                 }
                 None => drop(permit),
@@ -226,7 +268,10 @@ impl WorkerPool {
                 entry.cancel.store(true, Ordering::Relaxed);
                 Some(entry.handle)
             } else {
-                log::info!("[ProxyDM] cancel_and_wait id={} (not found, already done?)", id);
+                log::info!(
+                    "[ProxyDM] cancel_and_wait id={} (not found, already done?)",
+                    id
+                );
                 None
             }
         };
@@ -306,6 +351,7 @@ mod tests {
             part_ranges: vec![(0, 100)],
             part_downloaded: vec![],
             desired_connections: None,
+            is_hls: false,
         }
     }
 
@@ -351,7 +397,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let pool = WorkerPool::new(8, tx, false, 1, 0);
         assert_eq!(pool.next_id(), 1); // first call returns 1, increments to 2
-        // Active map should be empty
+                                       // Active map should be empty
         let active = pool.active.lock().await;
         assert!(active.is_empty());
     }

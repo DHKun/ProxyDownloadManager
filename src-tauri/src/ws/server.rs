@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tungstenite::Message;
 
@@ -18,8 +19,12 @@ use crate::types::{DownloadAck, Event, PendingDownloadRequest};
 /// 4. Raw URL text
 pub fn parse_message(text: &str) -> PendingDownloadRequest {
     if let Ok(mut req) = serde_json::from_str::<PendingDownloadRequest>(text) {
-        if !req.url.is_empty() {
-            req.headers = filter_headers(&req.headers);
+        // A claim with an empty URL must stay a claim so the socket can reject
+        // it. Falling through would treat the JSON text as a raw download URL.
+        if !req.url.is_empty() || req.action.eq_ignore_ascii_case("claim") {
+            if !req.url.is_empty() {
+                req.headers = filter_headers(&req.headers);
+            }
             if req.connections == 0 && text.contains("\"connections\"") {
                 // explicit 0 = Auto; keep it
             }
@@ -66,7 +71,11 @@ pub fn parse_message(text: &str) -> PendingDownloadRequest {
         .ok()
         .filter(|i| !i.url.is_empty())
         .map(|i| PendingDownloadRequest {
-            protocol_version: if i.protocol_version == 0 { 1 } else { i.protocol_version },
+            protocol_version: if i.protocol_version == 0 {
+                1
+            } else {
+                i.protocol_version
+            },
             request_id: i.request_id,
             action: i.action,
             url: i.url,
@@ -96,7 +105,56 @@ pub fn parse_message(text: &str) -> PendingDownloadRequest {
 }
 
 pub fn ack_json(ack: &DownloadAck) -> String {
-    serde_json::to_string(ack).unwrap_or_else(|_| r#"{"accepted":false,"reason":"serialize"}"#.into())
+    serde_json::to_string(ack)
+        .unwrap_or_else(|_| r#"{"accepted":false,"reason":"serialize"}"#.into())
+}
+
+/// What the socket should do with one inbound message.
+/// `Claim` only confirms the desktop is up. It must not open a download.
+#[derive(Debug, PartialEq, Eq)]
+enum WsRoute {
+    RejectEmpty,
+    Claim,
+    DuplicateAdd,
+    Forward,
+}
+
+const ADD_SEEN_TTL: Duration = Duration::from_secs(120);
+static ADD_SEEN: LazyLock<Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// First `add` for a request id is forwarded. A retry ACKs and does not open
+/// a second window. Empty ids (legacy clients) always forward.
+fn add_should_forward(request_id: &str) -> bool {
+    if request_id.is_empty() {
+        return true;
+    }
+    let mut seen = ADD_SEEN.lock().unwrap_or_else(|poison| poison.into_inner());
+    let now = Instant::now();
+    seen.retain(|_, at| now.duration_since(*at) < ADD_SEEN_TTL);
+    if seen.contains_key(request_id) {
+        return false;
+    }
+    seen.insert(request_id.to_string(), now);
+    true
+}
+
+fn route_request(req: &PendingDownloadRequest) -> WsRoute {
+    if req.action.eq_ignore_ascii_case("claim") {
+        return if req.url.is_empty() {
+            WsRoute::RejectEmpty
+        } else {
+            WsRoute::Claim
+        };
+    }
+    if req.url.is_empty() {
+        return WsRoute::RejectEmpty;
+    }
+    if add_should_forward(&req.request_id) {
+        WsRoute::Forward
+    } else {
+        WsRoute::DuplicateAdd
+    }
 }
 
 pub struct WsServer {
@@ -198,16 +256,34 @@ impl WsServer {
             match msg {
                 Message::Text(text) => {
                     let preview = redact_log(&text);
-                    let max_preview = preview.char_indices().nth(200).map(|(i, _)| i).unwrap_or(preview.len());
+                    let max_preview = preview
+                        .char_indices()
+                        .nth(200)
+                        .map(|(i, _)| i)
+                        .unwrap_or(preview.len());
                     log::info!("[ProxyDM WS] Received: {}", &preview[..max_preview]);
 
                     let request = parse_message(&text);
                     let request_id = request.request_id.clone();
 
-                    if request.url.is_empty() {
-                        let ack = DownloadAck::fail(&request_id, "empty url");
-                        let _ = ws.send(Message::Text(ack_json(&ack).into()));
-                        continue;
+                    match route_request(&request) {
+                        WsRoute::RejectEmpty => {
+                            let ack = DownloadAck::fail(&request_id, "empty url");
+                            let _ = ws.send(Message::Text(ack_json(&ack).into()));
+                            continue;
+                        }
+                        WsRoute::Claim | WsRoute::DuplicateAdd => {
+                            // Claim does not create a download. A repeated add
+                            // already opened the window; ACK so the extension
+                            // does not start a second browser download.
+                            let ack = DownloadAck::ok(&request_id);
+                            if let Err(e) = ws.send(Message::Text(ack_json(&ack).into())) {
+                                log::error!("[ProxyDM WS] ack send ERROR: {:?}", e);
+                                break;
+                            }
+                            continue;
+                        }
+                        WsRoute::Forward => {}
                     }
 
                     log::info!(
@@ -220,7 +296,8 @@ impl WsServer {
                         Ok(()) => DownloadAck::ok(&request_id),
                         Err(e) => {
                             log::error!("[ProxyDM WS] request_tx.send ERROR: {:?}", e);
-                            let ack = DownloadAck::fail(&request_id, "desktop not accepting downloads");
+                            let ack =
+                                DownloadAck::fail(&request_id, "desktop not accepting downloads");
                             let _ = ws.send(Message::Text(ack_json(&ack).into()));
                             break;
                         }
@@ -323,7 +400,45 @@ mod tests {
         assert!(req.headers.contains_key("Referer"));
         assert!(req.headers.contains_key("Authorization"));
         assert!(!req.headers.keys().any(|k| k.eq_ignore_ascii_case("host")));
-        assert!(!req.headers.keys().any(|k| k.to_ascii_lowercase().starts_with("sec-")));
+        assert!(!req
+            .headers
+            .keys()
+            .any(|k| k.to_ascii_lowercase().starts_with("sec-")));
+    }
+
+    #[test]
+    fn claim_acks_without_becoming_an_add() {
+        let id = format!("claim-{}", std::process::id());
+        let claim = parse_message(&format!(
+            r#"{{"action":"claim","request_id":"{id}","url":"https://cdn.example/a.txt","filename":"a.txt"}}"#
+        ));
+        assert_eq!(claim.action, "claim");
+        assert_eq!(route_request(&claim), WsRoute::Claim);
+        assert_eq!(route_request(&claim), WsRoute::Claim);
+
+        let add = parse_message(&format!(
+            r#"{{"action":"add","request_id":"{id}","url":"https://cdn.example/a.txt","filename":"a.txt"}}"#
+        ));
+        assert_eq!(route_request(&add), WsRoute::Forward);
+        assert_eq!(route_request(&add), WsRoute::DuplicateAdd);
+    }
+
+    #[test]
+    fn empty_claim_is_rejected() {
+        let req = parse_message(r#"{"action":"claim","request_id":"e1","url":""}"#);
+        assert_eq!(req.action, "claim");
+        assert!(req.url.is_empty());
+        assert_eq!(route_request(&req), WsRoute::RejectEmpty);
+    }
+
+    #[test]
+    fn legacy_add_without_request_id_always_forwards() {
+        let req = parse_message(
+            r#"{"action":"add","url":"https://cdn.example/b.zip","filename":"b.zip"}"#,
+        );
+        assert!(req.request_id.is_empty());
+        assert_eq!(route_request(&req), WsRoute::Forward);
+        assert_eq!(route_request(&req), WsRoute::Forward);
     }
 
     #[test]

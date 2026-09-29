@@ -38,11 +38,7 @@ impl IconCache {
     }
 
     pub fn get(&self, file_name: &str) -> IconData {
-        let ext = file_name
-            .rsplit('.')
-            .next()
-            .unwrap_or("")
-            .to_lowercase();
+        let ext = file_name.rsplit('.').next().unwrap_or("").to_lowercase();
         let ext_key = if ext.is_empty() {
             "generic".to_string()
         } else {
@@ -112,6 +108,10 @@ impl IconCache {
             }
         }
         let rgba = base64::engine::general_purpose::STANDARD.encode(&pixels);
-        IconData { rgba, width: 32, height: 32 }
+        IconData {
+            rgba,
+            width: 32,
+            height: 32,
+        }
     }
 }

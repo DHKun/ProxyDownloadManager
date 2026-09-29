@@ -38,14 +38,20 @@ struct ProgressBasis {
 fn reconcile(item: &DownloadItem, saved: Option<&DownloadState>) -> ProgressBasis {
     let ranges: Vec<PartRange> = if item.parts.is_empty() {
         if item.total_size > 0 {
-            vec![PartRange { start: 0, end: item.total_size }]
+            vec![PartRange {
+                start: 0,
+                end: item.total_size,
+            }]
         } else {
             vec![]
         }
     } else {
         item.parts
             .iter()
-            .map(|p| PartRange { start: p.start, end: p.end })
+            .map(|p| PartRange {
+                start: p.start,
+                end: p.end,
+            })
             .collect()
     };
 
@@ -64,7 +70,10 @@ fn reconcile(item: &DownloadItem, saved: Option<&DownloadState>) -> ProgressBasi
     // Candidate A: per-part progress from the DB row. When no parts were ever
     // planned the download was sequential, so a byte-total prefix is valid.
     let db_parts: Vec<u64> = if item.parts.is_empty() {
-        ranges.iter().map(|r| item.downloaded.min(r.len())).collect()
+        ranges
+            .iter()
+            .map(|r| item.downloaded.min(r.len()))
+            .collect()
     } else {
         item.parts
             .iter()
@@ -85,8 +94,7 @@ fn reconcile(item: &DownloadItem, saved: Option<&DownloadState>) -> ProgressBasi
 
     match (gob, gob_parts) {
         (Some(s), Some(parts))
-            if parts.iter().sum::<u64>() >= db_sum
-                && parts.iter().sum::<u64>() <= s.downloaded =>
+            if parts.iter().sum::<u64>() >= db_sum && parts.iter().sum::<u64>() <= s.downloaded =>
         {
             ProgressBasis {
                 downloaded: parts.iter().sum(),
@@ -195,7 +203,10 @@ impl ProgressLedger {
     /// flips back to Downloading when the engine actually starts.
     pub fn mark_queued(&self, id: u64) {
         if let Ok(Some(mut item)) = self.db.get_by_id(id) {
-            if matches!(item.status, DownloadStatus::Downloading | DownloadStatus::Connecting) {
+            if matches!(
+                item.status,
+                DownloadStatus::Downloading | DownloadStatus::Connecting
+            ) {
                 item.status = DownloadStatus::Queued;
                 let _ = self.db.update_download(&item);
             }
@@ -256,6 +267,43 @@ impl ProgressLedger {
         }
     }
 
+    /// Fill in an unknown total (HLS segment count) without touching a known size.
+    pub fn set_total_if_unknown(&self, id: u64, total: u64) {
+        if total == 0 {
+            return;
+        }
+        if let Ok(Some(mut item)) = self.db.get_by_id(id) {
+            if item.total_size == 0 {
+                item.total_size = total;
+                let _ = self.db.update_download(&item);
+            }
+        }
+    }
+
+    /// Reflect retrying / merging / downloading on a live row. Ignores a
+    /// worker that lost the race with pause, complete, or failure.
+    pub fn note_phase(&self, id: u64, phase: &str) {
+        let next = match phase {
+            "retrying" => DownloadStatus::Retrying,
+            "merging" => DownloadStatus::Merging,
+            "connecting" => DownloadStatus::Connecting,
+            "downloading" => DownloadStatus::Downloading,
+            _ => return,
+        };
+        if let Ok(Some(mut item)) = self.db.get_by_id(id) {
+            if matches!(
+                item.status,
+                DownloadStatus::Paused | DownloadStatus::Completed | DownloadStatus::Failed(_)
+            ) {
+                return;
+            }
+            if std::mem::discriminant(&item.status) != std::mem::discriminant(&next) {
+                item.status = next;
+                let _ = self.db.update_download(&item);
+            }
+        }
+    }
+
     /// Mark download as completed: clean up runtime, update DB status.
     pub fn on_completed(&self, id: u64) {
         self.runtime.remove(id);
@@ -286,17 +334,22 @@ impl ProgressLedger {
             item.error_message = error_msg.clone();
             item.last_error_at = now_str();
             item.retry_count = item.retry_count.saturating_add(1);
-            if let Some(code) = error_msg
-                .split_whitespace()
-                .find_map(|t| t.strip_prefix("HTTP").and_then(|s| s.parse::<u16>().ok()).or_else(|| t.parse::<u16>().ok()))
-            {
+            if let Some(code) = error_msg.split_whitespace().find_map(|t| {
+                t.strip_prefix("HTTP")
+                    .and_then(|s| s.parse::<u16>().ok())
+                    .or_else(|| t.parse::<u16>().ok())
+            }) {
                 item.http_status = Some(code);
             }
             if error_msg.to_ascii_lowercase().contains("timeout") {
                 item.error_code = "timeout".into();
             } else if item.http_status == Some(401) || item.http_status == Some(403) {
                 item.error_code = "auth".into();
-            } else if item.http_status.map(|c| crate::retry::is_retryable_status(c)).unwrap_or(false) {
+            } else if item
+                .http_status
+                .map(|c| crate::retry::is_retryable_status(c))
+                .unwrap_or(false)
+            {
                 item.error_code = "http".into();
             } else {
                 item.error_code = "failed".into();
@@ -414,7 +467,10 @@ impl ProgressLedger {
         Ok(items.into_iter().find_map(|i| {
             let same_url = i.url == url || (!i.final_url.is_empty() && i.final_url == url);
             let same_path = i.save_path == save_path;
-            if (same_url || same_path) && (i.status.is_live() || matches!(i.status, DownloadStatus::Queued | DownloadStatus::Paused)) {
+            if (same_url || same_path)
+                && (i.status.is_live()
+                    || matches!(i.status, DownloadStatus::Queued | DownloadStatus::Paused))
+            {
                 Some(i.id)
             } else {
                 None
@@ -507,7 +563,8 @@ mod tests {
 
     fn test_ledger(suffix: &str) -> (ProgressLedger, PathBuf) {
         gob::init_test_home();
-        let dir = std::env::temp_dir().join(format!("pdm_ledger_{}_{}", suffix, std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("pdm_ledger_{}_{}", suffix, std::process::id()));
         std::fs::create_dir_all(&dir).ok();
         let path = dir.join("test.db");
         let db = Db::from_path(&path).unwrap();
@@ -573,8 +630,21 @@ mod tests {
     fn reconcile_prefers_gob_when_it_has_more_progress() {
         let mut item = sample_item(1);
         item.parts = two_parts(100, 100); // DB says 200
-        // gob says only 300 bytes remain → 700 done
-        let gob = gob_state(1, 700, vec![Task { offset: 400, length: 100 }, Task { offset: 800, length: 200 }]);
+                                          // gob says only 300 bytes remain → 700 done
+        let gob = gob_state(
+            1,
+            700,
+            vec![
+                Task {
+                    offset: 400,
+                    length: 100,
+                },
+                Task {
+                    offset: 800,
+                    length: 200,
+                },
+            ],
+        );
         let basis = reconcile(&item, Some(&gob));
         assert_eq!(basis.downloaded, 700);
         assert_eq!(basis.part_downloaded, vec![400, 300]);
@@ -585,15 +655,37 @@ mod tests {
     fn reconcile_prefers_db_parts_over_stale_gob() {
         let mut item = sample_item(1);
         item.parts = two_parts(400, 300); // DB says 700
-        // stale gob from an earlier pause: says 700 bytes remain → 300 done
-        let gob = gob_state(1, 300, vec![Task { offset: 300, length: 200 }, Task { offset: 500, length: 500 }]);
+                                          // stale gob from an earlier pause: says 700 bytes remain → 300 done
+        let gob = gob_state(
+            1,
+            300,
+            vec![
+                Task {
+                    offset: 300,
+                    length: 200,
+                },
+                Task {
+                    offset: 500,
+                    length: 500,
+                },
+            ],
+        );
         let basis = reconcile(&item, Some(&gob));
         assert_eq!(basis.downloaded, 700);
         assert_eq!(basis.part_downloaded, vec![400, 300]);
         // tasks rebuilt from parts, not taken from the stale gob
         assert_eq!(
             basis.tasks,
-            vec![Task { offset: 400, length: 100 }, Task { offset: 800, length: 200 }]
+            vec![
+                Task {
+                    offset: 400,
+                    length: 100
+                },
+                Task {
+                    offset: 800,
+                    length: 200
+                }
+            ]
         );
     }
 
@@ -601,7 +693,14 @@ mod tests {
     fn reconcile_ignores_gob_with_mismatched_total_size() {
         let mut item = sample_item(1);
         item.parts = two_parts(100, 0);
-        let mut gob = gob_state(1, 900, vec![Task { offset: 900, length: 100 }]);
+        let mut gob = gob_state(
+            1,
+            900,
+            vec![Task {
+                offset: 900,
+                length: 100,
+            }],
+        );
         gob.total_size = 2000; // different file
         let basis = reconcile(&item, Some(&gob));
         assert_eq!(basis.downloaded, 100);
@@ -614,7 +713,14 @@ mod tests {
         // tasks would resume past bytes never fetched — must fall back to DB.
         let mut item = sample_item(1);
         item.parts = two_parts(100, 100);
-        let gob = gob_state(1, 300, vec![Task { offset: 800, length: 200 }]); // implies 800 done
+        let gob = gob_state(
+            1,
+            300,
+            vec![Task {
+                offset: 800,
+                length: 200,
+            }],
+        ); // implies 800 done
         let basis = reconcile(&item, Some(&gob));
         assert_eq!(basis.downloaded, 200, "under-covering gob must be rejected");
         assert_eq!(basis.part_downloaded, vec![100, 100]);
@@ -634,7 +740,16 @@ mod tests {
         // remaining work = everything
         assert_eq!(
             basis.tasks,
-            vec![Task { offset: 0, length: 500 }, Task { offset: 500, length: 500 }]
+            vec![
+                Task {
+                    offset: 0,
+                    length: 500
+                },
+                Task {
+                    offset: 500,
+                    length: 500
+                }
+            ]
         );
     }
 
@@ -667,7 +782,13 @@ mod tests {
         let basis = reconcile(&item, None);
         assert_eq!(basis.downloaded, 300);
         assert_eq!(basis.part_downloaded, vec![300]);
-        assert_eq!(basis.tasks, vec![Task { offset: 300, length: 700 }]);
+        assert_eq!(
+            basis.tasks,
+            vec![Task {
+                offset: 300,
+                length: 700
+            }]
+        );
     }
 
     // ── lifecycle ──
@@ -828,7 +949,16 @@ mod tests {
         let gob = gob::load_state(43).unwrap().unwrap();
         assert_eq!(
             gob.tasks,
-            vec![Task { offset: 0, length: 500 }, Task { offset: 500, length: 500 }]
+            vec![
+                Task {
+                    offset: 0,
+                    length: 500
+                },
+                Task {
+                    offset: 500,
+                    length: 500
+                }
+            ]
         );
 
         ledger.on_deleted(43).unwrap();
@@ -850,7 +980,13 @@ mod tests {
         assert_eq!(plan.downloaded, 600);
         assert_eq!(plan.part_ranges, vec![(0, 500), (500, 1000)]);
         assert_eq!(plan.part_downloaded, vec![500, 100]);
-        assert_eq!(plan.tasks, vec![Task { offset: 600, length: 400 }]);
+        assert_eq!(
+            plan.tasks,
+            vec![Task {
+                offset: 600,
+                length: 400
+            }]
+        );
         assert_eq!(plan.item.id, 50);
 
         // status flipped to Downloading, progress untouched
@@ -871,7 +1007,20 @@ mod tests {
         item.parts = two_parts(100, 100);
         ledger.insert_item(&item).unwrap();
         // engine-written gob: precise mid-chunk offsets, more progress than DB
-        let saved = gob_state(51, 700, vec![Task { offset: 450, length: 50 }, Task { offset: 700, length: 300 }]);
+        let saved = gob_state(
+            51,
+            700,
+            vec![
+                Task {
+                    offset: 450,
+                    length: 50,
+                },
+                Task {
+                    offset: 700,
+                    length: 300,
+                },
+            ],
+        );
         ledger.save_resume_state(51, &saved);
 
         let plan = ledger.begin_resume(51).unwrap();
@@ -985,7 +1134,14 @@ mod tests {
         assert_eq!(ledger.runtime.get_downloaded(10), Some(0));
 
         // Engine saved state: 500 bytes remain → 500 done.
-        let state = gob_state(10, 500, vec![Task { offset: 500, length: 500 }]);
+        let state = gob_state(
+            10,
+            500,
+            vec![Task {
+                offset: 500,
+                length: 500,
+            }],
+        );
         ledger.save_resume_state(10, &state);
 
         // Second start (resume) — runtime seeded via reconcile (500).

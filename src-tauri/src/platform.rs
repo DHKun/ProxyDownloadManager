@@ -20,7 +20,11 @@ pub fn sync_autostart(
 
     #[cfg(target_os = "linux")]
     {
-        if let Some(appimage) = app.env().appimage.and_then(|p| p.to_str().map(|s| s.to_string())) {
+        if let Some(appimage) = app
+            .env()
+            .appimage
+            .and_then(|p| p.to_str().map(|s| s.to_string()))
+        {
             builder.set_app_path(&appimage);
         } else {
             builder.set_app_path(&current_exe.display().to_string());
@@ -66,7 +70,9 @@ pub fn sync_extension_dirs(
 ) -> Result<bool, String> {
     let stamp_path = target_dir.join(DEPLOY_STAMP);
     let current = std::fs::read_to_string(&stamp_path).unwrap_or_default();
-    let browsers_present = EXTENSION_BROWSERS.iter().all(|name| target_dir.join(name).is_dir());
+    let browsers_present = EXTENSION_BROWSERS
+        .iter()
+        .all(|name| target_dir.join(name).is_dir());
     if current.trim() == version && browsers_present {
         return Ok(false);
     }
@@ -195,12 +201,18 @@ mod tests {
         write_ext(&src, "firefox", r#"{"version":"1"}"#);
 
         assert!(sync_extension_dirs(&src, &dst, "0.13.2").unwrap());
-        assert_eq!(fs::read_to_string(dst.join("chrome/manifest.json")).unwrap(), r#"{"version":"1"}"#);
+        assert_eq!(
+            fs::read_to_string(dst.join("chrome/manifest.json")).unwrap(),
+            r#"{"version":"1"}"#
+        );
         assert!(!sync_extension_dirs(&src, &dst, "0.13.2").unwrap());
 
         write_ext(&src, "chrome", r#"{"version":"2"}"#);
         assert!(sync_extension_dirs(&src, &dst, "0.13.3").unwrap());
-        assert_eq!(fs::read_to_string(dst.join("chrome/manifest.json")).unwrap(), r#"{"version":"2"}"#);
+        assert_eq!(
+            fs::read_to_string(dst.join("chrome/manifest.json")).unwrap(),
+            r#"{"version":"2"}"#
+        );
         let _ = fs::remove_dir_all(&tmp);
     }
 }

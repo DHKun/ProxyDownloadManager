@@ -1,5 +1,5 @@
-use crate::types::*;
 use crate::config;
+use crate::types::*;
 use std::sync::Mutex;
 
 pub struct SettingsService {
@@ -38,7 +38,8 @@ impl SettingsService {
     /// Returns change flags so the caller can handle Tauri-specific side effects (autostart, shortcuts).
     pub fn save(&self, new_settings: &Settings) -> PdmResult<SettingsSaveResult> {
         let old = self.get();
-        let tls_changed = old.danger_accept_invalid_certs != new_settings.danger_accept_invalid_certs;
+        let tls_changed =
+            old.danger_accept_invalid_certs != new_settings.danger_accept_invalid_certs;
         let shortcut_changed = old.global_shortcut != new_settings.global_shortcut;
 
         config::save(new_settings)?;
@@ -97,7 +98,10 @@ pub fn proxy_url(proxy: &ProxyConfig) -> String {
     } else {
         let user = urlencoding_minimal(&proxy.username);
         let pass = urlencoding_minimal(&proxy.password);
-        format!("{}://{}:{}@{}:{}", protocol, user, pass, proxy.host, proxy.port)
+        format!(
+            "{}://{}:{}@{}:{}",
+            protocol, user, pass, proxy.host, proxy.port
+        )
     }
 }
 

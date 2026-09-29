@@ -32,7 +32,11 @@ impl PartProgressTracker {
     /// Seed each part's downloaded bytes (e.g. from DB after pause). Caps at part length.
     pub fn seed_from_parts(self: &Arc<Self>, part_downloaded: &[u64]) {
         for (i, range) in self.ranges.iter().enumerate() {
-            let done = part_downloaded.get(i).copied().unwrap_or(0).min(range.len());
+            let done = part_downloaded
+                .get(i)
+                .copied()
+                .unwrap_or(0)
+                .min(range.len());
             self.downloaded[i].store(done, Ordering::Relaxed);
         }
     }
@@ -144,10 +148,7 @@ pub fn remaining_tasks_from_parts(
 /// Derive per-part downloaded bytes from remaining tasks: everything a task
 /// doesn't cover is done. Inverse of [`remaining_tasks_from_parts`], used to
 /// reconcile gob task lists with fixed part ranges.
-pub fn parts_downloaded_from_tasks(
-    ranges: &[PartRange],
-    tasks: &[crate::types::Task],
-) -> Vec<u64> {
+pub fn parts_downloaded_from_tasks(ranges: &[PartRange], tasks: &[crate::types::Task]) -> Vec<u64> {
     ranges
         .iter()
         .map(|range| {
@@ -174,7 +175,10 @@ mod tests {
     fn apply_write_splits_across_parts() {
         let ranges = vec![
             PartRange { start: 0, end: 100 },
-            PartRange { start: 100, end: 200 },
+            PartRange {
+                start: 100,
+                end: 200,
+            },
         ];
         let mut dl = vec![0u64; 2];
         apply_write_to_parts(&ranges, &mut dl, 80, 40); // 80..120
@@ -201,7 +205,10 @@ mod tests {
     fn tracker_record_write_and_snapshot() {
         let t = PartProgressTracker::new(vec![
             PartRange { start: 0, end: 100 },
-            PartRange { start: 100, end: 300 },
+            PartRange {
+                start: 100,
+                end: 300,
+            },
         ]);
         t.record_write(50, 100); // 50..150 → 50 in p0, 50 in p1
         assert_eq!(t.snapshot(), vec![50, 50]);
@@ -211,12 +218,21 @@ mod tests {
     fn parts_from_tasks_inverse_of_remaining() {
         let ranges = vec![
             PartRange { start: 0, end: 500 },
-            PartRange { start: 500, end: 1000 },
+            PartRange {
+                start: 500,
+                end: 1000,
+            },
         ];
         // 50 bytes remain mid-part-0, 300 remain at the tail of part 1
         let tasks = vec![
-            crate::types::Task { offset: 450, length: 50 },
-            crate::types::Task { offset: 700, length: 300 },
+            crate::types::Task {
+                offset: 450,
+                length: 50,
+            },
+            crate::types::Task {
+                offset: 700,
+                length: 300,
+            },
         ];
         assert_eq!(parts_downloaded_from_tasks(&ranges, &tasks), vec![450, 200]);
         // no tasks → everything done
@@ -230,7 +246,10 @@ mod tests {
     fn seed_from_parts_respects_saved_progress() {
         let t = PartProgressTracker::new(vec![
             PartRange { start: 0, end: 100 },
-            PartRange { start: 100, end: 200 },
+            PartRange {
+                start: 100,
+                end: 200,
+            },
         ]);
         t.seed_from_parts(&[100, 30]);
         assert_eq!(t.snapshot(), vec![100, 30]);
@@ -240,8 +259,14 @@ mod tests {
     fn remaining_tasks_skips_complete_parts() {
         let ranges = vec![
             PartRange { start: 0, end: 100 },
-            PartRange { start: 100, end: 300 },
-            PartRange { start: 300, end: 400 },
+            PartRange {
+                start: 100,
+                end: 300,
+            },
+            PartRange {
+                start: 300,
+                end: 400,
+            },
         ];
         let tasks = remaining_tasks_from_parts(&ranges, &[100, 50, 0]);
         assert_eq!(tasks.len(), 2);

@@ -1,9 +1,13 @@
 use crate::headers::apply_headers;
+use crate::network::limiter::MultiLimiter;
 use crate::network::pool::NetworkPool;
-use crate::types::{HlsVariantInfo, PdmError, PdmResult};
+use crate::types::{EngineConfig, Event, EventKind, HlsVariantInfo, PdmError, PdmResult};
+use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use url::Url;
 
 #[derive(Debug, Clone)]
@@ -45,7 +49,9 @@ pub fn parse_playlist(text: &str, base: &str) -> PdmResult<HlsPlaylist> {
             }
         }
         if line.starts_with("#EXT-X-STREAM-INF") {
-            let bw = attr(line, "BANDWIDTH").and_then(|s| s.parse().ok()).unwrap_or(0);
+            let bw = attr(line, "BANDWIDTH")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
             let res = attr(line, "RESOLUTION").unwrap_or_default();
             let codecs = attr(line, "CODECS").unwrap_or_default();
             pending_stream = Some((bw, res, codecs));
@@ -95,13 +101,7 @@ fn attr(line: &str, key: &str) -> Option<String> {
     if rest.starts_with('"') {
         Some(rest[1..].split('"').next().unwrap_or("").to_string())
     } else {
-        Some(
-            rest.split(',')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_string(),
-        )
+        Some(rest.split(',').next().unwrap_or("").trim().to_string())
     }
 }
 
@@ -124,21 +124,12 @@ pub async fn fetch_text(
     if !resp.status().is_success() {
         return Err(PdmError::Http(resp.status().as_u16()));
     }
-    resp.text().await.map_err(|e| PdmError::Network(e.to_string()))
+    resp.text()
+        .await
+        .map_err(|e| PdmError::Network(e.to_string()))
 }
 
-pub async fn download_hls(
-    media_url: &str,
-    save_path: &str,
-    headers: &HashMap<String, String>,
-    proxy: Option<&str>,
-    pool: &NetworkPool,
-    user_agent: &str,
-    connections: u32,
-    on_progress: impl Fn(u64, u64),
-) -> PdmResult<()> {
-    let text = fetch_text(media_url, headers, proxy, pool, user_agent).await?;
-    let plist = parse_playlist(&text, media_url)?;
+fn reject_unplayable(plist: &HlsPlaylist) -> PdmResult<()> {
     if plist.drm {
         return Err(PdmError::Unsupported(
             "DRM-protected HLS is not supported".into(),
@@ -149,72 +140,195 @@ pub async fn download_hls(
             "AES-128 HLS is not supported in this version".into(),
         ));
     }
-    let media = if plist.is_master {
-        let variant = plist
-            .variants
-            .iter()
-            .max_by_key(|v| v.bandwidth)
-            .ok_or_else(|| PdmError::Hls("master playlist has no variants".into()))?;
-        let nested = fetch_text(&variant.uri, headers, proxy, pool, user_agent).await?;
-        parse_playlist(&nested, &variant.uri)?
-    } else {
-        plist
-    };
+    if !plist.is_master && plist.segments.is_empty() {
+        return Err(PdmError::Hls("media playlist has no segments".into()));
+    }
+    Ok(())
+}
+
+async fn resolve_media(
+    media_url: &str,
+    headers: &HashMap<String, String>,
+    proxy: Option<&str>,
+    pool: &NetworkPool,
+    user_agent: &str,
+) -> PdmResult<HlsPlaylist> {
+    let text = fetch_text(media_url, headers, proxy, pool, user_agent).await?;
+    let plist = parse_playlist(&text, media_url)?;
+    reject_unplayable(&plist)?;
+    if !plist.is_master {
+        return Ok(plist);
+    }
+    let variant = plist
+        .variants
+        .iter()
+        .max_by_key(|v| v.bandwidth)
+        .ok_or_else(|| PdmError::Hls("master playlist has no variants".into()))?;
+    let nested = fetch_text(&variant.uri, headers, proxy, pool, user_agent).await?;
+    let media = parse_playlist(&nested, &variant.uri)?;
+    reject_unplayable(&media)?;
     if media.segments.is_empty() {
         return Err(PdmError::Hls("media playlist has no segments".into()));
     }
+    Ok(media)
+}
 
-    let pdm = crate::engine::file_io::pdm_path(save_path);
-    if let Some(parent) = std::path::Path::new(&pdm).parent() {
-        std::fs::create_dir_all(parent)?;
+pub struct HlsDownloader {
+    pool: Arc<NetworkPool>,
+    event_tx: mpsc::UnboundedSender<Event>,
+}
+
+impl HlsDownloader {
+    pub fn new(pool: Arc<NetworkPool>, event_tx: mpsc::UnboundedSender<Event>) -> Self {
+        Self { pool, event_tx }
     }
-    let total = media.segments.len() as u64;
-    let conns = connections.clamp(1, 16) as usize;
-    let client = pool.get_client(proxy)?;
-    let mut parts: Vec<Vec<u8>> = vec![Vec::new(); media.segments.len()];
-    let mut next = 0usize;
-    while next < media.segments.len() {
-        let end = (next + conns).min(media.segments.len());
-        let mut joins = Vec::new();
-        for i in next..end {
-            let uri = media.segments[i].uri.clone();
-            let client = client.clone();
-            let headers = headers.clone();
-            let ua = user_agent.to_string();
-            joins.push(tokio::spawn(async move {
-                let req = apply_headers(client.get(&uri), &headers, &ua);
-                let resp = req.send().await.map_err(|e| e.to_string())?;
-                if !resp.status().is_success() {
-                    return Err(format!("HTTP {}", resp.status().as_u16()));
+
+    pub async fn download(
+        &self,
+        cfg: &EngineConfig,
+        limiter: Arc<MultiLimiter>,
+        cancel: Arc<AtomicBool>,
+        _on_resume: &crate::engine::OnResumeState,
+    ) -> PdmResult<()> {
+        log::info!("[ProxyDM] hls id={} url={}", cfg.id, cfg.url);
+        if cancel.load(Ordering::Relaxed) {
+            return Err(PdmError::Cancelled);
+        }
+        let proxy = if cfg.proxy_url.is_empty() {
+            None
+        } else {
+            Some(cfg.proxy_url.as_str())
+        };
+        let media = resolve_media(
+            &cfg.url,
+            &cfg.headers,
+            proxy,
+            self.pool.as_ref(),
+            &cfg.user_agent,
+        )
+        .await?;
+        let total = media.segments.len() as u64;
+        if total == 0 {
+            return Err(PdmError::Hls("media playlist has no segments".into()));
+        }
+
+        let part_dir = crate::engine::file_io::hls_part_dir(cfg.id);
+        std::fs::create_dir_all(&part_dir)?;
+        let client = self.pool.get_client(proxy)?;
+        let conns = (if cfg.connections == 0 {
+            crate::engine::chunk::auto_connections(cfg.total_size)
+        } else {
+            cfg.connections
+        })
+        .clamp(1, 16) as usize;
+        let mut next = 0usize;
+        while next < media.segments.len() {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(PdmError::Cancelled);
+            }
+            let end = (next + conns).min(media.segments.len());
+            let mut joins = Vec::new();
+            for i in next..end {
+                let uri = media.segments[i].uri.clone();
+                let client = client.clone();
+                let headers = cfg.headers.clone();
+                let ua = cfg.user_agent.clone();
+                let path = part_dir.join(format!("{i:06}.part"));
+                let limiter = limiter.clone();
+                let cancel = cancel.clone();
+                joins.push(tokio::spawn(async move {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err("cancelled".to_string());
+                    }
+                    let req = apply_headers(client.get(&uri), &headers, &ua);
+                    let resp = req.send().await.map_err(|e| e.to_string())?;
+                    if !resp.status().is_success() {
+                        return Err(format!("HTTP {}", resp.status().as_u16()));
+                    }
+                    let mut stream = resp.bytes_stream();
+                    let mut file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+                    while let Some(chunk) = stream.next().await {
+                        if cancel.load(Ordering::Relaxed) {
+                            return Err("cancelled".to_string());
+                        }
+                        let chunk = chunk.map_err(|e| e.to_string())?;
+                        limiter.wait_n(chunk.len() as u64).await;
+                        file.write_all(&chunk).map_err(|e| e.to_string())?;
+                    }
+                    file.flush().map_err(|e| e.to_string())?;
+                    Ok(())
+                }));
+            }
+            for join in joins {
+                let result = join.await.map_err(|e| PdmError::Hls(e.to_string()))?;
+                if let Err(e) = result {
+                    if e == "cancelled" || cancel.load(Ordering::Relaxed) {
+                        return Err(PdmError::Cancelled);
+                    }
+                    return Err(PdmError::Hls(e));
                 }
-                resp.bytes()
-                    .await
-                    .map(|b| b.to_vec())
-                    .map_err(|e| e.to_string())
-            }));
+            }
+            next = end;
+            let _ = self.event_tx.send(Event {
+                kind: EventKind::DownloadProgress,
+                download_id: cfg.id,
+                data: Some(
+                    serde_json::json!({
+                        "downloaded": next as u64,
+                        "total": total,
+                        "phase": "downloading",
+                    })
+                    .to_string(),
+                ),
+            });
         }
-        for (offset, join) in joins.into_iter().enumerate() {
-            let bytes = join
-                .await
-                .map_err(|e| PdmError::Hls(e.to_string()))?
-                .map_err(PdmError::Hls)?;
-            parts[next + offset] = bytes;
-        }
-        next = end;
-        on_progress(next as u64, total);
-    }
 
-    let mut file = std::fs::File::create(&pdm)?;
-    for part in &parts {
-        file.write_all(part)?;
+        if cancel.load(Ordering::Relaxed) {
+            return Err(PdmError::Cancelled);
+        }
+
+        let _ = self.event_tx.send(Event {
+            kind: EventKind::DownloadProgress,
+            download_id: cfg.id,
+            data: Some(
+                serde_json::json!({
+                    "downloaded": total,
+                    "total": total,
+                    "phase": "merging",
+                })
+                .to_string(),
+            ),
+        });
+
+        crate::engine::file_io::migrate_legacy_temp(cfg.id, &cfg.save_path);
+        let pdm = crate::engine::file_io::temp_path(cfg.id);
+        if let Some(parent) = std::path::Path::new(&pdm).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = std::fs::File::create(&pdm)?;
+        for i in 0..media.segments.len() {
+            let path = part_dir.join(format!("{i:06}.part"));
+            let mut part = std::fs::File::open(&path)?;
+            std::io::copy(&mut part, &mut file)?;
+            drop(part);
+            let _ = std::fs::remove_file(&path);
+        }
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        let _ = std::fs::remove_dir_all(&part_dir);
+        crate::engine::file_io::finalize_file(cfg.id, &cfg.save_path)
+            .await
+            .map_err(PdmError::Io)?;
+
+        log::info!("[ProxyDM] hls id={} done segments={total}", cfg.id);
+        let _ = self.event_tx.send(Event {
+            kind: EventKind::DownloadCompleted,
+            download_id: cfg.id,
+            data: None,
+        });
+        Ok(())
     }
-    file.flush()?;
-    drop(file);
-    crate::engine::file_io::finalize_file(save_path)
-        .await
-        .map_err(PdmError::Io)?;
-    let _ = Arc::new(());
-    Ok(())
 }
 
 #[cfg(test)]

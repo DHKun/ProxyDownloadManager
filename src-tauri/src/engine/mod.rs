@@ -6,14 +6,14 @@ pub mod part_progress;
 pub mod single;
 pub mod task_download;
 
-use crate::types::{EngineConfig, DownloadState, PdmError, PdmResult};
-use crate::network::pool::NetworkPool;
 use crate::network::limiter::MultiLimiter;
+use crate::network::pool::NetworkPool;
+use crate::types::Event;
+use crate::types::{DownloadState, EngineConfig, PdmError, PdmResult};
+use async_trait::async_trait;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use crate::types::Event;
-use async_trait::async_trait;
 
 /// Callback invoked by the engine when a download is cancelled,
 /// to persist remaining tasks for resume. Avoids direct gob access.
@@ -59,6 +59,19 @@ impl DownloadEngine for concurrent::ConcurrentDownloader {
 }
 
 #[async_trait]
+impl DownloadEngine for hls::HlsDownloader {
+    async fn download(
+        &self,
+        cfg: &EngineConfig,
+        limiter: Arc<MultiLimiter>,
+        cancel: Arc<AtomicBool>,
+        on_cancelled: &OnResumeState,
+    ) -> PdmResult<()> {
+        self.download(cfg, limiter, cancel, on_cancelled).await
+    }
+}
+
+#[async_trait]
 impl DownloadEngine for single::SingleDownloader {
     async fn download(
         &self,
@@ -77,8 +90,13 @@ fn create_engine(
     pool: Arc<NetworkPool>,
     event_tx: &mpsc::UnboundedSender<Event>,
 ) -> Box<dyn DownloadEngine> {
-    if cfg.supports_range {
-        Box::new(concurrent::ConcurrentDownloader::new(pool, event_tx.clone()))
+    if cfg.is_hls {
+        Box::new(hls::HlsDownloader::new(pool, event_tx.clone()))
+    } else if cfg.supports_range {
+        Box::new(concurrent::ConcurrentDownloader::new(
+            pool,
+            event_tx.clone(),
+        ))
     } else {
         Box::new(single::SingleDownloader::new(pool, event_tx.clone()))
     }
@@ -92,9 +110,21 @@ pub async fn run_download(
     cancel: Arc<AtomicBool>,
     hooks: EngineHooks,
 ) -> PdmResult<()> {
-    let engine_kind = if cfg.supports_range { "concurrent" } else { "single" };
-    log::info!("[ProxyDM] run_download id={} engine={} url={} size={} range={}",
-        cfg.id, engine_kind, cfg.url, cfg.total_size, cfg.supports_range);
+    let engine_kind = if cfg.is_hls {
+        "hls"
+    } else if cfg.supports_range {
+        "concurrent"
+    } else {
+        "single"
+    };
+    log::info!(
+        "[ProxyDM] run_download id={} engine={} url={} size={} range={}",
+        cfg.id,
+        engine_kind,
+        cfg.url,
+        cfg.total_size,
+        cfg.supports_range
+    );
 
     let _ = event_tx.send(Event {
         kind: crate::types::EventKind::DownloadStarted,
@@ -104,7 +134,12 @@ pub async fn run_download(
 
     let engine = create_engine(&cfg, pool.clone(), &event_tx);
     let result = engine
-        .download(&cfg, limiter.clone(), cancel.clone(), &hooks.save_resume_state)
+        .download(
+            &cfg,
+            limiter.clone(),
+            cancel.clone(),
+            &hooks.save_resume_state,
+        )
         .await;
 
     // Degrade policy — a whitelist, not a catch-all: only failures that mean
@@ -113,17 +148,30 @@ pub async fn run_download(
     // everything; retry exhaustion and setup errors (file create, client
     // build, network) fail resumable — degrading them would destroy progress
     // a plain retry could keep.
+    let can_degrade = cfg.supports_range && !cfg.is_hls;
     let result = match result {
         Ok(()) => result,
-        Err(ref e) if !matches!(e, PdmError::RangeLost | PdmError::Incomplete(_)) => result,
+        Err(ref e)
+            if !(can_degrade && matches!(e, PdmError::RangeLost | PdmError::Incomplete(_))) =>
+        {
+            result
+        }
         Err(e) => {
-            log::error!("[ProxyDM] Concurrent id={} failed, degrading to Single: {}", cfg.id, e);
+            log::info!(
+                "[ProxyDM] Concurrent id={} failed, degrading to Single: {}",
+                cfg.id,
+                e
+            );
             // Records first, then the file: after invalidation a crash at any
             // point simply restarts the download from zero — no record can
             // claim progress the truncated file doesn't have.
             (hooks.invalidate_for_restart)(cfg.id);
-            let pdm_path = file_io::pdm_path(&cfg.save_path);
+            let pdm_path = file_io::temp_path(cfg.id);
+            if let Some(parent) = std::path::Path::new(&pdm_path).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
             let _ = std::fs::OpenOptions::new()
+                .create(true)
                 .write(true)
                 .truncate(true)
                 .open(&pdm_path);
@@ -133,7 +181,8 @@ pub async fn run_download(
                 download_id: cfg.id,
                 data: Some(part_progress::encode_progress_data(0, &[0], true)),
             });
-            let fallback: Box<dyn DownloadEngine> = Box::new(single::SingleDownloader::new(pool, event_tx.clone()));
+            let fallback: Box<dyn DownloadEngine> =
+                Box::new(single::SingleDownloader::new(pool, event_tx.clone()));
             fallback
                 .download(&cfg, limiter, cancel, &hooks.save_resume_state)
                 .await
@@ -141,8 +190,17 @@ pub async fn run_download(
     };
 
     match &result {
-        Ok(_) => log::info!("[ProxyDM] run_download id={} engine={} OK", cfg.id, engine_kind),
-        Err(e) => log::error!("[ProxyDM] run_download id={} engine={} FAILED: {}", cfg.id, engine_kind, e),
+        Ok(_) => log::info!(
+            "[ProxyDM] run_download id={} engine={} OK",
+            cfg.id,
+            engine_kind
+        ),
+        Err(e) => log::error!(
+            "[ProxyDM] run_download id={} engine={} FAILED: {}",
+            cfg.id,
+            engine_kind,
+            e
+        ),
     }
     result
 }
@@ -150,10 +208,10 @@ pub async fn run_download(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::EventKind;
     use crate::network::pool::NetworkPool;
-    use std::sync::Arc;
+    use crate::types::EventKind;
     use std::sync::atomic::Ordering;
+    use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn test_config(url: &str, supports_range: bool, total_size: u64) -> EngineConfig {
@@ -164,7 +222,7 @@ mod tests {
                 .to_str()
                 .unwrap()
                 .to_string(),
-            id: 1,
+            id: unique_test_id(),
             file_name: "file.bin".to_string(),
             is_resume: false,
             headers: std::collections::HashMap::new(),
@@ -185,7 +243,16 @@ mod tests {
             },
             part_downloaded: vec![],
             desired_connections: None,
+            is_hls: false,
         }
+    }
+
+    fn unique_test_id() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        (std::process::id() as u64)
+            .saturating_mul(10_000)
+            .saturating_add(NEXT.fetch_add(1, Ordering::Relaxed))
     }
 
     fn test_hooks() -> EngineHooks {
@@ -213,9 +280,13 @@ mod tests {
                 let mut total = Vec::new();
                 loop {
                     let n = stream.read(&mut buf).await.unwrap_or(0);
-                    if n == 0 { break; }
+                    if n == 0 {
+                        break;
+                    }
                     total.extend_from_slice(&buf[..n]);
-                    if total.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+                    if total.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
                 }
                 let req = String::from_utf8_lossy(&total);
                 let has_range = req.contains("Range: bytes=");
@@ -228,18 +299,21 @@ mod tests {
                         file_data.clone()
                     };
                     let content_len = body.len();
-                    let status_line = if supports_range && (req.contains("bytes=0-0") || has_range) {
+                    let status_line = if supports_range && (req.contains("bytes=0-0") || has_range)
+                    {
                         let range = if req.contains("bytes=0-0") {
                             (0u64, 0u64)
                         } else {
                             // Parse the Range header
-                            let start = req.lines()
+                            let start = req
+                                .lines()
                                 .find(|l| l.starts_with("Range:"))
                                 .and_then(|l| l.split("bytes=").nth(1))
                                 .and_then(|r| r.split('-').next())
                                 .and_then(|s| s.trim().parse::<u64>().ok())
                                 .unwrap_or(0);
-                            let end = req.lines()
+                            let end = req
+                                .lines()
                                 .find(|l| l.starts_with("Range:"))
                                 .and_then(|l| l.split("bytes=").nth(1))
                                 .and_then(|r| r.split('-').nth(1))
@@ -259,15 +333,18 @@ mod tests {
                         )
                     };
                     let _ = stream.write_all(status_line.as_bytes()).await;
-                    let response_body = if supports_range && !req.contains("bytes=0-0") && has_range {
+                    let response_body = if supports_range && !req.contains("bytes=0-0") && has_range
+                    {
                         // Parse range and send the requested bytes
-                        let start = req.lines()
+                        let start = req
+                            .lines()
                             .find(|l| l.starts_with("Range:"))
                             .and_then(|l| l.split("bytes=").nth(1))
                             .and_then(|r| r.split('-').next())
                             .and_then(|s| s.trim().parse::<u64>().ok())
                             .unwrap_or(0);
-                        let end = req.lines()
+                        let end = req
+                            .lines()
                             .find(|l| l.starts_with("Range:"))
                             .and_then(|l| l.split("bytes=").nth(1))
                             .and_then(|r| r.split('-').nth(1))
@@ -283,10 +360,8 @@ mod tests {
                 } else {
                     // Regular GET — return full file
                     let body = file_data.clone();
-                    let status_line = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
-                        body.len()
-                    );
+                    let status_line =
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
                     let _ = stream.write_all(status_line.as_bytes()).await;
                     let _ = stream.write_all(&body).await;
                 }
@@ -325,7 +400,10 @@ mod tests {
         let _ = run_download(cfg, pool, tx, limiter, cancel, test_hooks()).await;
 
         let event = rx.try_recv();
-        assert!(event.is_ok(), "Expected at least one event (DownloadStarted)");
+        assert!(
+            event.is_ok(),
+            "Expected at least one event (DownloadStarted)"
+        );
         assert!(matches!(event.unwrap().kind, EventKind::DownloadStarted));
     }
 
@@ -345,11 +423,15 @@ mod tests {
         let result = run_download(cfg, pool.clone(), tx, limiter, cancel, test_hooks()).await;
 
         // Single engine should succeed
-        assert!(result.is_ok(), "Single engine download failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Single engine download failed: {:?}",
+            result.err()
+        );
 
         // Clean up temp file
-        let save_path = std::env::temp_dir()
-            .join(format!("pdm_engine_single_{}.bin", std::process::id()));
+        let save_path =
+            std::env::temp_dir().join(format!("pdm_engine_single_{}.bin", std::process::id()));
         let _ = std::fs::remove_file(&save_path);
     }
 
@@ -369,14 +451,18 @@ mod tests {
 
         let result = run_download(cfg, pool.clone(), tx, limiter, cancel, test_hooks()).await;
 
-        assert!(result.is_ok(), "Concurrent engine download failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Concurrent engine download failed: {:?}",
+            result.err()
+        );
 
         // Clean up
-        let save_path = std::env::temp_dir()
-            .join(format!("pdm_engine_conc_{}.bin", std::process::id()));
+        let save_path =
+            std::env::temp_dir().join(format!("pdm_engine_conc_{}.bin", std::process::id()));
         let _ = std::fs::remove_file(&save_path);
-        let pdm_path = std::env::temp_dir()
-            .join(format!("pdm_engine_conc_{}.bin.pdm", std::process::id()));
+        let pdm_path =
+            std::env::temp_dir().join(format!("pdm_engine_conc_{}.bin.pdm", std::process::id()));
         let _ = std::fs::remove_file(&pdm_path);
     }
 
@@ -400,17 +486,31 @@ mod tests {
             events.push(event);
         }
 
-        let has_started = events.iter().any(|e| matches!(e.kind, EventKind::DownloadStarted));
-        let has_completed = events.iter().any(|e| matches!(e.kind, EventKind::DownloadCompleted));
-        let has_progress = events.iter().any(|e| matches!(e.kind, EventKind::DownloadProgress));
+        let has_started = events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::DownloadStarted));
+        let has_completed = events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::DownloadCompleted));
+        let has_progress = events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::DownloadProgress));
 
         assert!(has_started, "Missing DownloadStarted event");
-        assert!(has_completed, "Missing DownloadCompleted event (got {} events)", events.len());
-        assert!(has_progress, "Missing DownloadProgress events (got {} events)", events.len());
+        assert!(
+            has_completed,
+            "Missing DownloadCompleted event (got {} events)",
+            events.len()
+        );
+        assert!(
+            has_progress,
+            "Missing DownloadProgress events (got {} events)",
+            events.len()
+        );
 
         // Clean up
-        let save_path = std::env::temp_dir()
-            .join(format!("pdm_engine_progress_{}.bin", std::process::id()));
+        let save_path =
+            std::env::temp_dir().join(format!("pdm_engine_progress_{}.bin", std::process::id()));
         let _ = std::fs::remove_file(&save_path);
     }
 
@@ -453,15 +553,20 @@ mod tests {
         );
 
         // Clean up
-        let save_path = std::env::temp_dir()
-            .join(format!("pdm_engine_cancel_{}.bin", std::process::id()));
+        let save_path =
+            std::env::temp_dir().join(format!("pdm_engine_cancel_{}.bin", std::process::id()));
         let _ = std::fs::remove_file(&save_path);
-        let pdm_path = std::env::temp_dir()
-            .join(format!("pdm_engine_cancel_{}.bin.pdm", std::process::id()));
+        let pdm_path =
+            std::env::temp_dir().join(format!("pdm_engine_cancel_{}.bin.pdm", std::process::id()));
         let _ = std::fs::remove_file(&pdm_path);
     }
 
-    fn test_config_at(name: &str, url: &str, supports_range: bool, total_size: u64) -> EngineConfig {
+    fn test_config_at(
+        name: &str,
+        url: &str,
+        supports_range: bool,
+        total_size: u64,
+    ) -> EngineConfig {
         let mut cfg = test_config(url, supports_range, total_size);
         cfg.save_path = std::env::temp_dir()
             .join(format!("pdm_engine_{}_{}.bin", name, std::process::id()))
@@ -539,7 +644,6 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&save_path);
-        let _ = std::fs::remove_file(file_io::pdm_path(&save_path));
     }
 
     /// Server that honors Range only from offset 0; any offset>0 request gets
@@ -558,15 +662,26 @@ mod tests {
                 let mut total = Vec::new();
                 loop {
                     let n = stream.read(&mut buf).await.unwrap_or(0);
-                    if n == 0 { break; }
+                    if n == 0 {
+                        break;
+                    }
                     total.extend_from_slice(&buf[..n]);
-                    if total.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+                    if total.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
                 }
                 let req = String::from_utf8_lossy(&total);
                 let range = req.lines().find(|l| l.starts_with("Range:")).map(|l| {
                     let spec = l.split("bytes=").nth(1).unwrap_or("0-");
-                    let start = spec.split('-').next().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
-                    let end = spec.split('-').nth(1).and_then(|s| s.trim().parse::<u64>().ok())
+                    let start = spec
+                        .split('-')
+                        .next()
+                        .and_then(|s| s.trim().parse::<u64>().ok())
+                        .unwrap_or(0);
+                    let end = spec
+                        .split('-')
+                        .nth(1)
+                        .and_then(|s| s.trim().parse::<u64>().ok())
                         .unwrap_or(file_data.len() as u64 - 1);
                     (start, end)
                 });
@@ -582,7 +697,10 @@ mod tests {
                     }
                     _ => {
                         // offset>0 or no Range: pretend ranges don't exist
-                        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", file_data.len());
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                            file_data.len()
+                        );
                         let _ = stream.write_all(head.as_bytes()).await;
                         let _ = stream.write_all(&file_data).await;
                     }
@@ -602,6 +720,7 @@ mod tests {
 
         let cfg = test_config_at("rangelost", &url, true, file_data.len() as u64);
         let save_path = cfg.save_path.clone();
+        let download_id = cfg.id;
 
         let pool = Arc::new(NetworkPool::new(false));
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -617,19 +736,70 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_ok(), "degrade to single should complete: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "degrade to single should complete: {:?}",
+            result.err()
+        );
         assert!(
             invalidated.load(Ordering::Relaxed),
             "degrade must invalidate progress records before truncating"
         );
         let written = std::fs::read(&save_path).expect("final file missing");
         assert_eq!(written.len(), file_data.len());
-        assert_eq!(written, file_data, "degraded download must produce intact content");
+        assert_eq!(
+            written, file_data,
+            "degraded download must produce intact content"
+        );
         assert!(
-            !std::path::Path::new(&file_io::pdm_path(&save_path)).exists(),
-            ".pdm must be renamed away on completion"
+            !std::path::Path::new(&file_io::temp_path(download_id)).exists(),
+            "temp file must be renamed away on completion"
         );
 
         let _ = std::fs::remove_file(&save_path);
+    }
+
+    #[tokio::test]
+    async fn test_single_short_body_stays_incomplete() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let body = vec![b'x'; 60];
+            let head = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+            let _ = stream.write_all(head.as_bytes()).await;
+            let _ = stream.write_all(&body).await;
+        });
+        let url = format!("http://127.0.0.1:{}/short.bin", addr.port());
+        let cfg = test_config_at("short", &url, false, 100);
+        let save_path = cfg.save_path.clone();
+        let id = cfg.id;
+        let pool = Arc::new(NetworkPool::new(false));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let result = run_download(
+            cfg,
+            pool,
+            tx,
+            Arc::new(MultiLimiter::new(0, 0)),
+            Arc::new(AtomicBool::new(false)),
+            test_hooks(),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(PdmError::Incomplete(_))),
+            "short body must not complete: {:?}",
+            result
+        );
+        assert!(
+            !std::path::Path::new(&save_path).exists(),
+            "final file must not exist"
+        );
+        assert!(
+            std::path::Path::new(&file_io::temp_path(id)).exists(),
+            ".pdm must be kept"
+        );
+        let _ = std::fs::remove_file(file_io::temp_path(id));
     }
 }

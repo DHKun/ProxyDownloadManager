@@ -10,6 +10,11 @@ pub fn init_home_dir(home: String) {
 
 /// Get the configured home directory, falling back to ~/.ProxyDM.
 fn home_dir() -> String {
+    // Tests share this OnceLock across threads. Pin it before the first read
+    // so one test cannot create `{id}.pdm` under ~/.ProxyDM and another test's
+    // init_test_home() make finalize look in the empty test temp dir.
+    #[cfg(test)]
+    init_test_home();
     HOME_DIR.get().cloned().unwrap_or_else(|| {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         home.join(".ProxyDM").to_string_lossy().to_string()
@@ -22,11 +27,17 @@ fn home_dir() -> String {
 #[cfg(test)]
 pub fn init_test_home() {
     let dir = std::env::temp_dir().join(format!("pdm_test_home_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
     let _ = HOME_DIR.set(dir.to_string_lossy().to_string());
 }
 
 pub fn state_dir() -> PathBuf {
     PathBuf::from(home_dir()).join("state")
+}
+
+/// Partial downloads live here, one file per id: `{home}/temp/{id}.pdm`.
+pub fn temp_dir() -> PathBuf {
+    PathBuf::from(home_dir()).join("temp")
 }
 
 pub fn detail_path(id: u64) -> PathBuf {
@@ -54,7 +65,8 @@ pub fn load_state(id: u64) -> Result<Option<crate::types::DownloadState>, String
         return Ok(None);
     }
     let json = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let state: crate::types::DownloadState = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+    let state: crate::types::DownloadState =
+        serde_json::from_str(&json).map_err(|e| e.to_string())?;
     Ok(Some(state))
 }
 
@@ -85,7 +97,8 @@ pub fn take_pending_request() -> Result<Option<crate::types::PendingDownloadRequ
     }
     let json = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
     std::fs::remove_file(&path).ok();
-    let req: crate::types::PendingDownloadRequest = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+    let req: crate::types::PendingDownloadRequest =
+        serde_json::from_str(&json).map_err(|e| e.to_string())?;
     Ok(Some(req))
 }
 
@@ -102,7 +115,10 @@ mod tests {
             save_path: format!("/tmp/file{}.zip", id),
             total_size: 1000,
             downloaded: 500,
-            tasks: vec![Task { offset: 500, length: 500 }],
+            tasks: vec![Task {
+                offset: 500,
+                length: 500,
+            }],
             proxy_name: "".to_string(),
             workers: 4,
         }

@@ -53,14 +53,17 @@ impl DownloadManagerState {
     /// Register a new active download (called when download starts).
     pub fn register(&self, id: u64) {
         let mut map = recover_lock(self.inner.lock());
-        map.insert(id, DownloadRuntime {
-            downloaded: 0,
-            part_downloaded: vec![],
-            last_flushed: 0,
-            parts_dirty: false,
-            single_reset: false,
-            restart_pending: false,
-        });
+        map.insert(
+            id,
+            DownloadRuntime {
+                downloaded: 0,
+                part_downloaded: vec![],
+                last_flushed: 0,
+                parts_dirty: false,
+                single_reset: false,
+                restart_pending: false,
+            },
+        );
     }
 
     /// Invalidate for a truncate-and-restart, atomically: zero the entry and
@@ -91,12 +94,18 @@ impl DownloadManagerState {
     ) -> ApplyOutcome {
         let mut map = recover_lock(self.inner.lock());
         let Some(rt) = map.get_mut(&id) else {
-            return ApplyOutcome { applied: false, first_single_reset: false };
+            return ApplyOutcome {
+                applied: false,
+                first_single_reset: false,
+            };
         };
         if rt.restart_pending {
             if !is_reset_event {
                 // Stale pre-restart event — drop it.
-                return ApplyOutcome { applied: false, first_single_reset: false };
+                return ApplyOutcome {
+                    applied: false,
+                    first_single_reset: false,
+                };
             }
             rt.restart_pending = false;
         }
@@ -109,7 +118,10 @@ impl DownloadManagerState {
             rt.part_downloaded = parts;
             rt.parts_dirty = true;
         }
-        ApplyOutcome { applied: true, first_single_reset }
+        ApplyOutcome {
+            applied: true,
+            first_single_reset,
+        }
     }
 
     /// Update progress in memory (no DB write).
@@ -217,7 +229,10 @@ mod tests {
     #[test]
     fn test_flush_skips_armed_restart() {
         let state = test_state();
-        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let dir = std::env::temp_dir().join(format!("pdm_flush_arm_test_{}", ts));
         std::fs::create_dir_all(&dir).ok();
         let db = crate::state::db::Db::from_path(&dir.join("test.db")).unwrap();
@@ -248,7 +263,10 @@ mod tests {
         // …the restart's own reset event clears the gate…
         let reset = state.apply_progress(1, 0, Some(vec![0]), true);
         assert!(reset.applied);
-        assert!(!reset.first_single_reset, "arm_restart already did the DB reset");
+        assert!(
+            !reset.first_single_reset,
+            "arm_restart already did the DB reset"
+        );
         // …and normal progress flushes again.
         state.apply_progress(1, 100, Some(vec![100]), true);
         assert_eq!(state.flush_to_db(&db), 1);
@@ -260,7 +278,10 @@ mod tests {
     #[test]
     fn test_flush_to_db() {
         let state = test_state();
-        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let dir = std::env::temp_dir().join(format!("pdm_flush_test_{}", ts));
         std::fs::create_dir_all(&dir).ok();
         let db_path = dir.join("test.db");

@@ -114,19 +114,38 @@ impl DownloadManager {
                 downloaded,
                 part_downloaded,
                 reset_to_single,
+                total,
+                phase,
             } => {
-                self.ledger.record_progress(
-                    dl_id,
-                    downloaded,
-                    part_downloaded.clone(),
-                    reset_to_single,
-                );
-                let mut payload = serde_json::json!({ "id": dl_id, "downloaded": downloaded });
+                if let Some(total) = total {
+                    self.ledger.set_total_if_unknown(dl_id, total);
+                }
+                if let Some(phase) = phase.as_deref() {
+                    self.ledger.note_phase(dl_id, phase);
+                }
+                if let Some(downloaded) = downloaded {
+                    self.ledger.record_progress(
+                        dl_id,
+                        downloaded,
+                        part_downloaded.clone(),
+                        reset_to_single,
+                    );
+                }
+                let mut payload = serde_json::json!({ "id": dl_id });
+                if let Some(downloaded) = downloaded {
+                    payload["downloaded"] = serde_json::json!(downloaded);
+                }
                 if let Some(parts) = part_downloaded {
                     payload["parts"] = serde_json::json!(parts);
                 }
                 if reset_to_single {
                     payload["reset_to_single"] = serde_json::json!(true);
+                }
+                if let Some(total) = total {
+                    payload["total_size"] = serde_json::json!(total);
+                }
+                if let Some(phase) = phase {
+                    payload["status"] = serde_json::json!(phase);
                 }
                 self.bus.emit(FrontendEvent::DownloadProgress, payload);
             }
@@ -191,8 +210,10 @@ impl DownloadManager {
         self.log_info(&format!("Pause id={}", id));
         self.worker_pool.cancel_and_wait(id).await;
         self.ledger.on_paused(id)?;
-        self.bus
-            .emit(FrontendEvent::DownloadPaused, serde_json::json!({ "id": id }));
+        self.bus.emit(
+            FrontendEvent::DownloadPaused,
+            serde_json::json!({ "id": id }),
+        );
         Ok(())
     }
 
@@ -217,16 +238,38 @@ impl DownloadManager {
             && plan.item.total_size > 0
             && plan.downloaded >= plan.item.total_size
         {
-            let pdm_path = crate::engine::file_io::pdm_path(&plan.item.save_path);
-            if std::path::Path::new(&pdm_path).exists() {
-                let _ = std::fs::rename(&pdm_path, &plan.item.save_path);
+            let save_path = plan.item.save_path.clone();
+            let file_name = plan.item.file_name.clone();
+            crate::engine::file_io::migrate_legacy_temp(id, &save_path);
+            let temp = crate::engine::file_io::temp_path(id);
+            if std::path::Path::new(&temp).exists() {
+                match crate::engine::file_io::finalize_file(id, &save_path).await {
+                    Ok(()) => {
+                        self.ledger.on_completed(id);
+                        self.bus.emit(
+                            FrontendEvent::DownloadCompleted,
+                            serde_json::json!({ "id": id, "file_name": file_name }),
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        let _ = self.ledger.on_paused(id);
+                        return Err(PdmError::Io(e));
+                    }
+                }
             }
-            self.ledger.on_completed(id);
-            self.bus.emit(
-                FrontendEvent::DownloadCompleted,
-                serde_json::json!({ "id": id, "file_name": plan.item.file_name }),
-            );
-            return Ok(());
+            if std::path::Path::new(&save_path).exists() {
+                self.ledger.on_completed(id);
+                self.bus.emit(
+                    FrontendEvent::DownloadCompleted,
+                    serde_json::json!({ "id": id, "file_name": file_name }),
+                );
+                return Ok(());
+            }
+            let _ = self.ledger.on_paused(id);
+            return Err(PdmError::Io(format!(
+                "partial file missing for download {id}"
+            )));
         }
 
         let settings = self.settings.get();
@@ -241,7 +284,11 @@ impl DownloadManager {
             settings.max_retries,
         );
 
-        match self.worker_pool.add_with_id(cfg, id, self.make_hooks()).await {
+        match self
+            .worker_pool
+            .add_with_id(cfg, id, self.make_hooks())
+            .await
+        {
             Ok(Admission::Started) => {}
             Ok(Admission::Queued) => {
                 // All slots busy: the row waits as Queued and starts on its own.
@@ -254,8 +301,10 @@ impl DownloadManager {
                 return Err(e);
             }
         }
-        self.bus
-            .emit(FrontendEvent::DownloadResumed, serde_json::json!({ "id": id }));
+        self.bus.emit(
+            FrontendEvent::DownloadResumed,
+            serde_json::json!({ "id": id }),
+        );
         Ok(())
     }
 
@@ -275,16 +324,26 @@ impl DownloadManager {
 
         self.worker_pool.cancel_and_wait(id).await;
         self.ledger.on_deleted(id)?;
-
+        crate::engine::file_io::remove_temp(id);
         if let Some(path) = save_path {
-            crate::engine::file_io::remove_download_files(&path);
+            let _ = std::fs::remove_file(path);
         }
         Ok(())
     }
 
     /// Cancel a download without deleting records.
     pub async fn cancel_download(&self, id: u64) {
+        let was_queued = self
+            .ledger
+            .get_item(id)
+            .ok()
+            .flatten()
+            .map(|item| matches!(item.status, DownloadStatus::Queued))
+            .unwrap_or(false);
         self.worker_pool.cancel(id).await;
+        if was_queued {
+            let _ = self.ledger.on_paused(id);
+        }
         self.bus.emit(
             FrontendEvent::DownloadCancelled,
             serde_json::json!({ "id": id }),
@@ -359,15 +418,33 @@ impl DownloadManager {
     }
 
     pub async fn set_runtime_connections(&self, id: u64, connections: u32) -> PdmResult<()> {
-        let n = connections.min(crate::engine::chunk::MAX_CONNECTIONS).max(1);
-        self.ledger.update_connections(id, n)?;
-        let _ = self.worker_pool.set_connections(id, n).await;
+        let applied = if connections == 0 {
+            let size = self
+                .ledger
+                .get_item(id)
+                .ok()
+                .flatten()
+                .map(|item| item.total_size)
+                .unwrap_or(0);
+            crate::engine::chunk::auto_connections(size).min(crate::engine::chunk::MAX_CONNECTIONS)
+        } else {
+            connections
+                .min(crate::engine::chunk::MAX_CONNECTIONS)
+                .max(1)
+        };
+        // 0 stays stored as Auto; the pool receives the size-based count.
+        self.ledger
+            .update_connections(id, if connections == 0 { 0 } else { applied })?;
+        let _ = self.worker_pool.set_connections(id, applied).await;
         Ok(())
     }
 
     pub async fn set_runtime_rate_limit(&self, id: u64, rate_limit_bps: u64) -> PdmResult<()> {
         self.ledger.update_rate_limit(id, rate_limit_bps)?;
-        let _ = self.worker_pool.set_download_rate_limit(id, rate_limit_bps).await;
+        let _ = self
+            .worker_pool
+            .set_download_rate_limit(id, rate_limit_bps)
+            .await;
         Ok(())
     }
 
@@ -382,10 +459,7 @@ impl DownloadManager {
         headers: std::collections::HashMap<String, String>,
     ) -> PdmResult<()> {
         let headers = crate::headers::filter_headers(&headers);
-        let existing = self
-            .ledger
-            .get_item(id)?
-            .ok_or(PdmError::NotFound(id))?;
+        let existing = self.ledger.get_item(id)?.ok_or(PdmError::NotFound(id))?;
         let pool = self.worker_pool.pool_ref();
         let proxy_url = self.settings.resolve_proxy_url(&existing.proxy_name);
         let user_agents = self.settings.build_user_agents();
@@ -479,9 +553,10 @@ impl DownloadManager {
             ));
         }
 
+        let requested_connections = spec.connections;
         let connections = crate::engine::chunk::compute_connection_count(
             file_size,
-            spec.connections,
+            requested_connections,
             settings.max_connections,
         );
 
@@ -493,22 +568,21 @@ impl DownloadManager {
         let candidate = std::path::Path::new(&save_dir).join(&file_name);
         let candidate_str = candidate.to_string_lossy().to_string();
 
-        if let Some(dup) = self.ledger.find_active_duplicate(&spec.url, &candidate_str)? {
+        if let Some(dup) = self
+            .ledger
+            .find_active_duplicate(&spec.url, &candidate_str)?
+        {
             return Err(PdmError::DuplicateDownload(dup));
         }
 
-        let full_path = apply_conflict_policy(
-            &save_dir,
-            &file_name,
-            settings.file_conflict,
-        )?;
+        let full_path = apply_conflict_policy(&save_dir, &file_name, settings.file_conflict)?;
 
         crate::engine::chunk::check_disk_space(&full_path, file_size)?;
 
         let id = self.worker_pool.next_id();
         let plan = crate::engine::chunk::plan_chunks(
             file_size,
-            connections,
+            requested_connections,
             supports_range && !outcome.is_hls,
             settings.max_connections,
         );
@@ -527,7 +601,11 @@ impl DownloadManager {
             },
             parts: plan.parts,
             proxy_name: spec.proxy_name,
-            connections,
+            connections: if requested_connections == 0 {
+                0
+            } else {
+                connections
+            },
             resumable: Some(supports_range),
             created_at: now_str(),
             last_try: String::new(),
@@ -537,7 +615,16 @@ impl DownloadManager {
             } else {
                 outcome.final_url
             },
-            content_type: outcome.content_type,
+            content_type: if outcome.is_hls
+                && !outcome
+                    .content_type
+                    .to_ascii_lowercase()
+                    .contains("mpegurl")
+            {
+                "application/vnd.apple.mpegurl".into()
+            } else {
+                outcome.content_type
+            },
             etag: outcome.etag,
             last_modified: outcome.last_modified,
             rate_limit_bps: spec.rate_limit_bps,
@@ -549,71 +636,21 @@ impl DownloadManager {
             return Ok(id);
         }
 
-        if outcome.is_hls {
-            return self.spawn_hls(item, proxy_url_str).await;
-        }
-
         let cfg = item.to_engine_config(
             &proxy_url_str.unwrap_or_default(),
             &settings.user_agent,
             settings.global_rate_limit,
             settings.max_retries,
         );
-        match self.worker_pool.add_with_id(cfg, id, self.make_hooks()).await? {
+        match self
+            .worker_pool
+            .add_with_id(cfg, id, self.make_hooks())
+            .await?
+        {
             Admission::Queued => self.ledger.mark_queued(id),
             Admission::Started => {}
         }
 
-        Ok(id)
-    }
-
-    async fn spawn_hls(&self, item: DownloadItem, proxy_url: Option<String>) -> PdmResult<u64> {
-        let id = item.id;
-        let pool = self.worker_pool.pool_ref();
-        let headers = item.headers.clone();
-        let save_path = item.save_path.clone();
-        let url = if item.final_url.is_empty() {
-            item.url.clone()
-        } else {
-            item.final_url.clone()
-        };
-        let ua = self.settings.get().user_agent;
-        let conns = item.connections.max(1);
-        let ledger = self.ledger.clone();
-        let bus = self.bus.clone();
-        tauri::async_runtime::spawn(async move {
-            ledger.on_started(id);
-            let result = crate::engine::hls::download_hls(
-                &url,
-                &save_path,
-                &headers,
-                proxy_url.as_deref(),
-                pool.as_ref(),
-                &ua,
-                conns,
-                |done, total| {
-                    let _ = done;
-                    let _ = total;
-                },
-            )
-            .await;
-            match result {
-                Ok(()) => {
-                    ledger.on_completed(id);
-                    bus.emit(
-                        crate::event_bus::FrontendEvent::DownloadCompleted,
-                        serde_json::json!({ "id": id, "file_name": item.file_name }),
-                    );
-                }
-                Err(e) => {
-                    ledger.on_error(id, e.to_string());
-                    bus.emit(
-                        crate::event_bus::FrontendEvent::DownloadError,
-                        serde_json::json!({ "id": id, "url": url, "message": e.to_string() }),
-                    );
-                }
-            }
-        });
         Ok(id)
     }
 }
@@ -636,12 +673,10 @@ pub fn apply_conflict_policy(
     }
     match policy {
         crate::types::FileConflictPolicy::Rename => Ok(unique_filename(dir, filename)),
-        crate::types::FileConflictPolicy::Overwrite => {
-            Ok(candidate.to_string_lossy().to_string())
-        }
-        crate::types::FileConflictPolicy::Skip | crate::types::FileConflictPolicy::Ask => {
-            Err(PdmError::FileExists(candidate.to_string_lossy().to_string()))
-        }
+        crate::types::FileConflictPolicy::Overwrite => Ok(candidate.to_string_lossy().to_string()),
+        crate::types::FileConflictPolicy::Skip | crate::types::FileConflictPolicy::Ask => Err(
+            PdmError::FileExists(candidate.to_string_lossy().to_string()),
+        ),
     }
 }
 

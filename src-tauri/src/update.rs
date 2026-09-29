@@ -44,17 +44,25 @@ pub fn compare_versions(a: &str, b: &str) -> i32 {
     for i in 0..max_len {
         let a_val = a_parts.get(i).copied().unwrap_or(0);
         let b_val = b_parts.get(i).copied().unwrap_or(0);
-        if a_val > b_val { return 1; }
-        if a_val < b_val { return -1; }
+        if a_val > b_val {
+            return 1;
+        }
+        if a_val < b_val {
+            return -1;
+        }
     }
     0
 }
 
 pub fn current_platform_suffix() -> &'static str {
     #[cfg(target_os = "macos")]
-    { return ".dmg"; }
+    {
+        return ".dmg";
+    }
     #[cfg(target_os = "windows")]
-    { return ".exe"; }
+    {
+        return ".exe";
+    }
     #[cfg(target_os = "linux")]
     {
         if std::path::Path::new("/usr/bin/apt").exists()
@@ -84,14 +92,18 @@ pub async fn check_update(
     let has_update = compare_versions(&latest_version, &current_version) > 0;
 
     let platform_suffix = current_platform_suffix();
-    let assets: Vec<AssetInfo> = release.assets.into_iter().map(|a| {
-        let recommended = a.name.ends_with(platform_suffix);
-        AssetInfo {
-            name: a.name,
-            url: a.browser_download_url,
-            recommended,
-        }
-    }).collect();
+    let assets: Vec<AssetInfo> = release
+        .assets
+        .into_iter()
+        .map(|a| {
+            let recommended = a.name.ends_with(platform_suffix);
+            AssetInfo {
+                name: a.name,
+                url: a.browser_download_url,
+                recommended,
+            }
+        })
+        .collect();
 
     Ok(UpdateInfo {
         latest_version,

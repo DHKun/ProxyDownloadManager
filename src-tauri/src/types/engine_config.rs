@@ -29,6 +29,8 @@ pub struct EngineConfig {
     pub part_downloaded: Vec<u64>,
     /// Live worker target. `None` means use `connections`.
     pub desired_connections: Option<Arc<AtomicU32>>,
+    /// HLS playlist download. Runs through the same worker slot as HTTP.
+    pub is_hls: bool,
 }
 
 /// Everything the engine needs to continue a download, produced by the
@@ -94,8 +96,14 @@ impl DownloadItem {
             part_ranges,
             part_downloaded,
             desired_connections: None,
+            is_hls: item_is_hls(self),
         }
     }
+}
+
+pub fn item_is_hls(item: &DownloadItem) -> bool {
+    let ct = item.content_type.to_ascii_lowercase();
+    ct.contains("mpegurl") || item.file_name.to_ascii_lowercase().ends_with(".m3u8")
 }
 
 impl ResumePlan {
@@ -113,6 +121,7 @@ impl ResumePlan {
             .find(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
             .map(|(_, v)| v.clone())
             .unwrap_or_else(|| user_agent.to_string());
+        let is_hls = item_is_hls(&self.item);
         EngineConfig {
             url: if self.item.final_url.is_empty() {
                 self.item.url
@@ -137,6 +146,7 @@ impl ResumePlan {
             part_ranges: self.part_ranges,
             part_downloaded: self.part_downloaded,
             desired_connections: None,
+            is_hls,
         }
     }
 }

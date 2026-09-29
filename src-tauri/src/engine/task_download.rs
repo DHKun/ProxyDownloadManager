@@ -1,9 +1,9 @@
-use crate::network::limiter::MultiLimiter;
-use crate::types::Task;
 use crate::engine::file_io::write_at;
 use crate::engine::part_progress::PartProgressTracker;
 use crate::headers::apply_headers;
+use crate::network::limiter::MultiLimiter;
 use crate::retry::{is_fatal_client_status, is_retryable_status};
+use crate::types::Task;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -20,6 +20,9 @@ pub enum TaskResult {
     /// Server ignored the Range header — retrying is pointless; concurrent
     /// download cannot proceed at all.
     RangeNotSupported,
+    /// HTTP 206 whose Content-Range does not match the bytes we asked for.
+    /// Nothing was written.
+    InvalidRangeResponse,
     /// Unrecoverable error — don't retry this chunk.
     Fatal(String),
     /// Client error that must not be retried (401/403/404…).
@@ -41,6 +44,43 @@ fn note_write(
     }
 }
 
+/// `Content-Range: bytes start-end/total` (`total` may be `*`).
+pub fn parse_content_range(header: &str) -> Option<(u64, u64, Option<u64>)> {
+    let rest = header.trim().strip_prefix("bytes ")?;
+    let (range, total) = rest.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start: u64 = start.trim().parse().ok()?;
+    let end: u64 = end.trim().parse().ok()?;
+    let total = match total.trim() {
+        "*" => None,
+        s => Some(s.parse().ok()?),
+    };
+    Some((start, end, total))
+}
+
+/// A 206 is usable only when the returned interval sits inside the request
+/// and, when we already know the object size, the total matches.
+pub fn validate_content_range(
+    requested_start: u64,
+    requested_end: u64,
+    actual_start: u64,
+    actual_end: u64,
+    actual_total: Option<u64>,
+    expected_total: u64,
+) -> bool {
+    if actual_start != requested_start || actual_end < actual_start || actual_end > requested_end {
+        return false;
+    }
+    if expected_total > 0 {
+        if let Some(total) = actual_total {
+            if total != expected_total {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 pub async fn download_task(
     url: &str,
     client: &reqwest::Client,
@@ -52,6 +92,7 @@ pub async fn download_task(
     bytes_written: &AtomicU64,
     parts: Option<Arc<PartProgressTracker>>,
     headers: &HashMap<String, String>,
+    expected_total: u64,
 ) -> TaskResult {
     let mut written: u64 = 0;
     let range_end = if task.length == 0 {
@@ -62,7 +103,11 @@ pub async fn download_task(
     let range_header = format!("bytes={}-{}", task.offset, range_end);
     let mut req = client.get(url).header("Range", &range_header);
     req = apply_headers(req, headers, user_agent);
-    log::info!("[ProxyDM] concurrent_task offset={} range_end={}", task.offset, range_end);
+    log::debug!(
+        "[ProxyDM] concurrent_task offset={} range_end={}",
+        task.offset,
+        range_end
+    );
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
@@ -72,7 +117,11 @@ pub async fn download_task(
                 msg.push_str(&format!(": {}", s));
                 src = s.source();
             }
-            log::error!("[ProxyDM] concurrent_task REQUEST ERROR offset={}: {}", task.offset, msg);
+            log::error!(
+                "[ProxyDM] concurrent_task REQUEST ERROR offset={}: {}",
+                task.offset,
+                msg
+            );
             return TaskResult::Fatal(msg);
         }
     };
@@ -87,12 +136,76 @@ pub async fn download_task(
     }
 
     let status = resp.status();
-    log::info!("[ProxyDM] concurrent_task offset={} HTTP {} (expected 206 or 200)", task.offset, status);
+    log::debug!(
+        "[ProxyDM] concurrent_task offset={} HTTP {}",
+        task.offset,
+        status
+    );
 
-    // For offset > 0: 200 means the server ignored Range — not retryable.
-    if status == reqwest::StatusCode::OK && task.offset > 0 {
-        log::warn!("[ProxyDM] server ignored Range header (HTTP 200), offset={}", task.offset);
-        return TaskResult::RangeNotSupported;
+    // 200 on a Range request means the server ignored the range. The first
+    // chunk may still be a full-object 200 whose Content-Length matches the
+    // task; anything else must not be written at this offset.
+    if status == reqwest::StatusCode::OK {
+        let content_len = resp
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+        let ignored = if task.offset > 0 {
+            true
+        } else {
+            match content_len {
+                Some(n) if task.length > 0 && n > task.length => true,
+                _ => false,
+            }
+        };
+        if ignored {
+            log::warn!(
+                "[ProxyDM] server ignored Range header (HTTP 200), offset={}",
+                task.offset
+            );
+            return TaskResult::RangeNotSupported;
+        }
+    }
+    let mut body_limit = task.length;
+    if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        let header = resp
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let Some(header) = header else {
+            log::warn!("[ProxyDM] 206 missing Content-Range offset={}", task.offset);
+            return TaskResult::InvalidRangeResponse;
+        };
+        let Some((start, end, total)) = parse_content_range(&header) else {
+            log::warn!(
+                "[ProxyDM] 206 bad Content-Range {:?} offset={}",
+                header,
+                task.offset
+            );
+            return TaskResult::InvalidRangeResponse;
+        };
+        let requested_end = if task.length == 0 {
+            u64::MAX
+        } else {
+            task.offset + task.length - 1
+        };
+        if !validate_content_range(
+            task.offset,
+            requested_end,
+            start,
+            end,
+            total,
+            expected_total,
+        ) {
+            log::warn!(
+                "[ProxyDM] Content-Range {start}-{end}/{total:?} != requested {}-{} total={expected_total}",
+                task.offset, requested_end
+            );
+            return TaskResult::InvalidRangeResponse;
+        }
+        body_limit = end - start + 1;
     }
     if status != reqwest::StatusCode::OK && status != reqwest::StatusCode::PARTIAL_CONTENT {
         let code = status.as_u16();
@@ -134,7 +247,10 @@ pub async fn download_task(
             let remaining = chunk_size.saturating_sub(written);
             if remaining > 0 {
                 return TaskResult::Partial {
-                    remaining: Task { offset: base_offset + written, length: remaining },
+                    remaining: Task {
+                        offset: base_offset + written,
+                        length: remaining,
+                    },
                 };
             }
             return TaskResult::Cancelled;
@@ -146,24 +262,34 @@ pub async fn download_task(
             && chunk_size > 0
             && written < chunk_size / 10
         {
-            log::info!("[ProxyDM] slow chunk offset={} written={}/{} after {}s, re-queuing",
-                base_offset, written, chunk_size, elapsed.as_secs());
+            log::debug!(
+                "[ProxyDM] slow chunk offset={} written={}/{} after {}s, re-queuing",
+                base_offset,
+                written,
+                chunk_size,
+                elapsed.as_secs()
+            );
             let remaining = chunk_size.saturating_sub(written);
             return TaskResult::Partial {
-                remaining: Task { offset: base_offset + written, length: remaining },
+                remaining: Task {
+                    offset: base_offset + written,
+                    length: remaining,
+                },
             };
         }
 
-        let chunk_result = tokio::time::timeout(
-            std::time::Duration::from_secs(10), stream.next()
-        ).await;
+        let chunk_result =
+            tokio::time::timeout(std::time::Duration::from_secs(10), stream.next()).await;
         let chunk = match chunk_result {
             Ok(Some(Ok(c))) => c,
             Ok(Some(Err(e))) => {
                 let remaining = chunk_size.saturating_sub(written);
                 if remaining > 0 && written > 0 {
                     return TaskResult::Partial {
-                        remaining: Task { offset: base_offset + written, length: remaining },
+                        remaining: Task {
+                            offset: base_offset + written,
+                            length: remaining,
+                        },
                     };
                 }
                 return TaskResult::Fatal(format!("Stream error: {}", e));
@@ -194,7 +320,10 @@ pub async fn download_task(
                     let remaining = chunk_size.saturating_sub(written);
                     if remaining > 0 {
                         return TaskResult::Partial {
-                            remaining: Task { offset: base_offset + written, length: remaining },
+                            remaining: Task {
+                                offset: base_offset + written,
+                                length: remaining,
+                            },
                         };
                     }
                     return TaskResult::Cancelled;
@@ -209,13 +338,30 @@ pub async fn download_task(
         // Bound the write to this task's region: a server that ignores Range
         // on the offset-0 task streams the WHOLE file — everything past
         // chunk_size belongs to other tasks and would only inflate counters.
-        if chunk_size > 0 && written + buf.len() as u64 >= chunk_size {
-            buf.truncate((chunk_size - written) as usize);
+        // A short Content-Range caps even earlier; the unread tail is re-queued.
+        let cap = if chunk_size == 0 {
+            body_limit
+        } else if body_limit == 0 {
+            chunk_size
+        } else {
+            chunk_size.min(body_limit)
+        };
+        if cap > 0 && written + buf.len() as u64 >= cap {
+            buf.truncate((cap - written) as usize);
             if let Err(e) = write_at(file, &buf, base_offset + written) {
                 return TaskResult::Fatal(format!("write_at error: {}", e));
             }
             let n = buf.len() as u64;
             note_write(bytes_written, parts.as_deref(), base_offset + written, n);
+            written += n;
+            if chunk_size > written {
+                return TaskResult::Partial {
+                    remaining: Task {
+                        offset: base_offset + written,
+                        length: chunk_size - written,
+                    },
+                };
+            }
             return TaskResult::Complete;
         }
 
@@ -230,6 +376,14 @@ pub async fn download_task(
         }
     }
 
+    if chunk_size > written {
+        return TaskResult::Partial {
+            remaining: Task {
+                offset: base_offset + written,
+                length: chunk_size - written,
+            },
+        };
+    }
     TaskResult::Complete
 }
 
@@ -245,14 +399,49 @@ mod tests {
 
     #[test]
     fn task_result_partial_has_remaining() {
-        let remaining = Task { offset: 3000, length: 2000 };
-        let r = TaskResult::Partial { remaining: remaining.clone() };
+        let remaining = Task {
+            offset: 3000,
+            length: 2000,
+        };
+        let r = TaskResult::Partial {
+            remaining: remaining.clone(),
+        };
         if let TaskResult::Partial { remaining } = r {
             assert_eq!(remaining.offset, 3000);
             assert_eq!(remaining.length, 2000);
         } else {
             panic!("expected Partial");
         }
+    }
+
+    #[test]
+    fn content_range_accepts_exact_match() {
+        assert!(validate_content_range(0, 99, 0, 99, Some(100), 100));
+        assert!(validate_content_range(50, 99, 50, 80, Some(100), 100));
+    }
+
+    #[test]
+    fn content_range_rejects_bad_start_end_and_total() {
+        assert!(!validate_content_range(10, 20, 0, 20, Some(100), 100));
+        assert!(!validate_content_range(0, 10, 0, 11, Some(100), 100));
+        assert!(!validate_content_range(0, 10, 5, 4, Some(100), 100));
+        assert!(!validate_content_range(0, 10, 0, 10, Some(99), 100));
+    }
+
+    #[test]
+    fn content_range_missing_total_ok_when_size_unknown() {
+        assert!(validate_content_range(0, 10, 0, 10, None, 0));
+        assert!(validate_content_range(0, 10, 0, 10, None, 100));
+    }
+
+    #[test]
+    fn parse_content_range_star_total() {
+        assert_eq!(parse_content_range("bytes 0-9/*"), Some((0, 9, None)));
+        assert_eq!(
+            parse_content_range("bytes 8-15/100"),
+            Some((8, 15, Some(100)))
+        );
+        assert_eq!(parse_content_range("not-a-range"), None);
     }
 
     #[test]

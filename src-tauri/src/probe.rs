@@ -1,5 +1,5 @@
-use crate::types::{PdmError, PdmResult};
 use crate::network::pool::NetworkPool;
+use crate::types::{PdmError, PdmResult};
 use std::collections::HashMap;
 use std::error::Error;
 
@@ -22,14 +22,32 @@ pub async fn probe(
     pool: &NetworkPool,
     user_agents: &[String],
 ) -> PdmResult<ProbeResult> {
-    let client = pool.get_client(proxy).map_err(|e| PdmError::ClientBuild(e.to_string()))?;
-    log::info!("[ProxyDM] probe start url={} proxy={:?} uas={}", url, proxy, user_agents.len());
+    let client = pool
+        .get_client(proxy)
+        .map_err(|e| PdmError::ClientBuild(e.to_string()))?;
+    log::info!(
+        "[ProxyDM] probe start url={} proxy={:?} uas={}",
+        url,
+        proxy,
+        user_agents.len()
+    );
 
     // Try each UA, return first success
     let mut first_err: Option<String> = None;
-    for (i, ua) in user_agents.iter().chain(std::iter::once(&String::new())).enumerate() {
-        log::info!("[ProxyDM] probe attempt #{} ua_prefix={:?}...", i,
-            &ua[..ua.char_indices().nth(40).map(|(i, _)| i).unwrap_or(ua.len())]);
+    for (i, ua) in user_agents
+        .iter()
+        .chain(std::iter::once(&String::new()))
+        .enumerate()
+    {
+        log::info!(
+            "[ProxyDM] probe attempt #{} ua_prefix={:?}...",
+            i,
+            &ua[..ua
+                .char_indices()
+                .nth(40)
+                .map(|(i, _)| i)
+                .unwrap_or(ua.len())]
+        );
         // Try Range first to detect 206 support
         let mut range_req = client.get(url);
         range_req = range_req.header("Range", "bytes=0-0");
@@ -58,28 +76,34 @@ pub async fn probe(
         let supports_range = status == reqwest::StatusCode::PARTIAL_CONTENT;
 
         let file_size = if supports_range {
-            resp.headers().get("content-range")
+            resp.headers()
+                .get("content-range")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| {
-                    s.split('/').nth(1).and_then(|n| n.trim().parse::<u64>().ok())
+                    s.split('/')
+                        .nth(1)
+                        .and_then(|n| n.trim().parse::<u64>().ok())
                 })
                 .unwrap_or(0)
         } else if status == reqwest::StatusCode::OK {
-            resp.headers().get("content-length")
+            resp.headers()
+                .get("content-length")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0)
-        } else if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::METHOD_NOT_ALLOWED {
+        } else if status == reqwest::StatusCode::FORBIDDEN
+            || status == reqwest::StatusCode::METHOD_NOT_ALLOWED
+        {
             let mut get_req = client.get(url);
             get_req = get_req.timeout(std::time::Duration::from_secs(30));
             get_req = crate::headers::apply_headers(get_req, headers, ua);
             match get_req.send().await {
-                Ok(r2) if r2.status().is_success() => {
-                    r2.headers().get("content-length")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or(0)
-                }
+                Ok(r2) if r2.status().is_success() => r2
+                    .headers()
+                    .get("content-length")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0),
                 Ok(r2) if crate::retry::is_fatal_client_status(r2.status().as_u16()) => {
                     return Err(PdmError::Http(r2.status().as_u16()));
                 }
@@ -122,7 +146,13 @@ pub async fn probe(
         let file_name = crate::filename::extract_filename(url, cd_owned.as_deref())
             .unwrap_or_else(|| "download".to_string());
 
-        log::info!("[ProxyDM] probe SUCCESS ua#{} range={} size={} name={}", i, supports_range, file_size, file_name);
+        log::info!(
+            "[ProxyDM] probe SUCCESS ua#{} range={} size={} name={}",
+            i,
+            supports_range,
+            file_size,
+            file_name
+        );
         return Ok(ProbeResult {
             supports_range,
             file_size,
@@ -203,7 +233,11 @@ pub async fn probe_with_fallback(
 
     match result {
         Ok(r) => {
-            let name = if filename_override.is_empty() { r.file_name } else { filename_override.to_string() };
+            let name = if filename_override.is_empty() {
+                r.file_name
+            } else {
+                filename_override.to_string()
+            };
             ProbeOutcome {
                 file_name: crate::filename::sanitize(&name),
                 file_size: r.file_size,
@@ -469,7 +503,9 @@ mod tests {
         let pool = Arc::new(NetworkPool::new(false));
         let mut headers = HashMap::new();
         headers.insert("Cookie".into(), "sid=abc".into());
-        let r = probe(&url, &headers, None, &pool, &["ua".into()]).await.unwrap();
+        let r = probe(&url, &headers, None, &pool, &["ua".into()])
+            .await
+            .unwrap();
         assert_eq!(r.file_size, 2048);
         assert!(r.supports_range);
     }
@@ -480,7 +516,9 @@ mod tests {
         let pool = Arc::new(NetworkPool::new(false));
         let mut headers = HashMap::new();
         headers.insert("Referer".into(), "https://app.example/".into());
-        let r = probe(&url, &headers, None, &pool, &["ua".into()]).await.unwrap();
+        let r = probe(&url, &headers, None, &pool, &["ua".into()])
+            .await
+            .unwrap();
         assert_eq!(r.file_name, "secret.bin");
     }
 
@@ -490,7 +528,9 @@ mod tests {
         let pool = Arc::new(NetworkPool::new(false));
         let mut headers = HashMap::new();
         headers.insert("Authorization".into(), "Bearer tok".into());
-        let r = probe(&url, &headers, None, &pool, &["ua".into()]).await.unwrap();
+        let r = probe(&url, &headers, None, &pool, &["ua".into()])
+            .await
+            .unwrap();
         assert!(r.supports_range);
     }
 
@@ -499,7 +539,9 @@ mod tests {
         let url = spawn_guarded_server("Authorization:", "Bearer tok").await;
         let pool = Arc::new(NetworkPool::new(false));
         let headers = HashMap::new();
-        let err = probe(&url, &headers, None, &pool, &["ua".into()]).await.unwrap_err();
+        let err = probe(&url, &headers, None, &pool, &["ua".into()])
+            .await
+            .unwrap_err();
         assert!(matches!(err, PdmError::Http(403) | PdmError::Probe(_)));
     }
 }

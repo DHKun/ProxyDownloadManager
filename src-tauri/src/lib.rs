@@ -1,29 +1,29 @@
-mod types;
-mod config;
-mod logger;
-mod state;
-mod probe;
-mod engine;
-mod network;
-mod worker;
-mod ws;
 mod cmd;
-mod headers;
-mod retry;
-mod tray;
-mod icons;
-mod filename;
+mod config;
 mod download_manager;
-mod update;
-mod platform;
+mod engine;
 mod event_bus;
 mod event_handler;
+mod filename;
+mod headers;
+mod icons;
+mod logger;
+mod network;
+mod platform;
+mod probe;
+mod retry;
 mod services;
+mod state;
+mod tray;
+mod types;
+mod update;
+mod worker;
+mod ws;
 
 use crate::cmd::AppState;
 use crate::download_manager::DownloadManager;
-use crate::services::settings_service::SettingsService;
 use crate::services::network_service::NetworkService;
+use crate::services::settings_service::SettingsService;
 use std::sync::Arc;
 use tauri::Manager;
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
@@ -44,8 +44,13 @@ fn hide_from_dock() {
 /// Configure main window: title, close-to-tray, initial visibility.
 fn setup_window(app: &tauri::App, silent_start: bool) {
     let handle = app.handle();
-    let Some(window) = handle.get_webview_window("main") else { return };
-    let _ = window.set_title(&format!("ProxyDownloadManager {}", handle.package_info().version));
+    let Some(window) = handle.get_webview_window("main") else {
+        return;
+    };
+    let _ = window.set_title(&format!(
+        "ProxyDownloadManager {}",
+        handle.package_info().version
+    ));
     if !silent_start {
         let _ = window.show();
         let _ = window.set_focus();
@@ -139,7 +144,8 @@ fn crash_recovery(ledger: &crate::state::ledger::ProgressLedger) {
 pub fn run() {
     let silent_start = std::env::args().any(|arg| arg == SILENT_START_ARG);
     let (event_tx, event_rx) = mpsc::unbounded_channel();
-    let (request_tx, request_rx) = mpsc::unbounded_channel::<crate::types::PendingDownloadRequest>();
+    let (request_tx, request_rx) =
+        mpsc::unbounded_channel::<crate::types::PendingDownloadRequest>();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -193,7 +199,13 @@ pub fn run() {
             let danger_accept_invalid_certs = settings.danger_accept_invalid_certs;
             let next_id_start = db.max_id().unwrap_or(0) + 1;
             let ledger = Arc::new(crate::state::ledger::ProgressLedger::new(db));
-            let worker_pool = crate::worker::WorkerPool::new(8, event_tx.clone(), danger_accept_invalid_certs, next_id_start, settings.global_rate_limit);
+            let worker_pool = crate::worker::WorkerPool::new(
+                8,
+                event_tx.clone(),
+                danger_accept_invalid_certs,
+                next_id_start,
+                settings.global_rate_limit,
+            );
             let logger = crate::logger::Logger::new().expect("Failed to initialize logger");
 
             let network_svc = Arc::new(NetworkService::new(worker_pool.pool_ref()));
@@ -240,7 +252,11 @@ pub fn run() {
             #[cfg(desktop)]
             if !shortcut_key.is_empty() {
                 if let Err(e) = app.global_shortcut().register(shortcut_key.as_str()) {
-                    log::error!("[ProxyDM] Failed to register global shortcut '{}': {}", shortcut_key, e);
+                    log::error!(
+                        "[ProxyDM] Failed to register global shortcut '{}': {}",
+                        shortcut_key,
+                        e
+                    );
                 }
             }
 
@@ -278,6 +294,11 @@ pub fn run() {
             update::check_update,
             cmd::open_file,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            if let tauri::RunEvent::Exit = event {
+                log::logger().flush();
+            }
+        });
 }

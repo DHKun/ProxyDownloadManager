@@ -8,16 +8,46 @@ pub fn sanitize(name: &str) -> String {
     const INVALID: &[char] = &['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
     let mut s: String = name
         .chars()
-        .map(|c| if c.is_control() || INVALID.contains(&c) { '_' } else { c })
+        .map(|c| {
+            if c.is_control() || INVALID.contains(&c) {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect();
     s = s.trim().trim_end_matches(['.', ' ']).to_string();
 
-    let stem_upper = s.split('.').next().unwrap_or("").trim().to_ascii_uppercase();
+    let stem_upper = s
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_uppercase();
     let reserved = matches!(
         stem_upper.as_str(),
-        "CON" | "PRN" | "AUX" | "NUL"
-            | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9"
-            | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9"
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
     );
     if reserved {
         s = format!("_{}", s);

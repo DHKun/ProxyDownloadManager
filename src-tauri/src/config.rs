@@ -1,5 +1,5 @@
-use crate::types::{PdmError, PdmResult};
 use crate::types::Settings;
+use crate::types::{PdmError, PdmResult};
 use std::path::PathBuf;
 
 fn config_path() -> PathBuf {
@@ -24,7 +24,11 @@ pub fn load() -> Settings {
     match toml::from_str(&content) {
         Ok(s) => s,
         Err(e) => {
-            log::error!("[ProxyDM] Failed to parse config at {:?}: {}. Using defaults.", path, e);
+            log::error!(
+                "[ProxyDM] Failed to parse config at {:?}: {}. Using defaults.",
+                path,
+                e
+            );
             Settings::default()
         }
     }
@@ -51,13 +55,16 @@ mod tests {
         s.max_connections = 16;
         s.max_retries = 5;
         s.user_agent = "TestAgent/1.0".to_string();
-        s.proxies.insert("p1".to_string(), crate::types::ProxyConfig {
-            protocol: crate::types::ProxyProtocol::Socks5,
-            host: "127.0.0.1".to_string(),
-            port: 1080,
-            username: String::new(),
-            password: String::new(),
-        });
+        s.proxies.insert(
+            "p1".to_string(),
+            crate::types::ProxyConfig {
+                protocol: crate::types::ProxyProtocol::Socks5,
+                host: "127.0.0.1".to_string(),
+                port: 1080,
+                username: String::new(),
+                password: String::new(),
+            },
+        );
 
         let toml_str = toml::to_string(&s).unwrap();
         let back: Settings = toml::from_str(&toml_str).unwrap();
