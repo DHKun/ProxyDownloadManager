@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use objc2::rc::Retained;
-use objc2::Alloc;
+use objc2::AnyThread;
 use objc2_app_kit::{
     NSBitmapImageRep, NSCompositingOperation, NSGraphicsContext, NSImage, NSWorkspace,
 };

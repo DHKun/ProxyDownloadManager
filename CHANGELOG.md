@@ -5,6 +5,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- macOS 构建能通过：分配文件图标位图时使用 objc2::AnyThread
+
 ## [0.16.0] - 2026-09-29
 
 ### Added
