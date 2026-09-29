@@ -10,6 +10,7 @@ const en = {
     about: "About",
     extension: "Browsers",
     quit: "Quit",
+    more: "More",
   },
   sidebar: {
     filters: "Filters",
@@ -26,6 +27,7 @@ const en = {
     typeAudio: "Audio",
     typeDocument: "Documents",
     typeOther: "Other",
+    filter: "Filter",
   },
   rateLimit: {
     unlimited: "Unlimited",
@@ -42,6 +44,12 @@ const en = {
     copyUrl: "Copy URL",
     refreshUrl: "Refresh URL",
     properties: "Properties",
+  },
+  status: {
+    connecting: "Connecting…",
+    retrying: "Retrying",
+    merging: "Merging",
+    failed: "Failed",
   },
   downloadTable: {
     loading: "Loading...",
@@ -83,10 +91,16 @@ const en = {
     refreshUrl: "Refresh URL",
     newUrl: "New URL",
     authHidden: "Request credentials are stored and not shown.",
+    segments: "{done} / {total} segments",
+    resumeRestarts: "Pausing this download restarts it from the beginning.",
+    error: "Error",
+    eta: "ETA",
   },
   settings: {
     title: "Settings",
     download: "Download",
+    network: "Network",
+    app: "App",
     downloadDir: "Download Directory",
     browse: "Browse",
     maxThreads: "Max Threads",
@@ -151,6 +165,12 @@ const en = {
     finalUrl: "Final URL",
     suggested: "Suggested connections",
     browse: "Browse",
+    probeIdle: "Waiting for a URL",
+    probeFailed: "Could not probe this file",
+    probeFailedHint: "You can still start the download.",
+    direct: "Direct",
+    auto: "Auto",
+    autoSuggested: "Auto ({n})",
   },
   log: {
     title: "Log",

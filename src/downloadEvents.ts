@@ -10,11 +10,15 @@ import { applyPartDownloaded } from "./utils/progressMap";
 /** Wire payloads (field names are Rust snake_case, mirrored by event_handler.rs tests). */
 export interface ProgressPayload {
   id: number;
-  downloaded: number;
+  /** Omitted on phase-only events (retrying / merging). Must not be treated as zero. */
+  downloaded?: number;
   /** Per-part downloaded BYTES aligned with DownloadItem.parts — not DownloadPart[]. */
   parts?: number[];
   /** Concurrent → Single degrade: the Progress Map collapses to one cell. */
   reset_to_single?: boolean;
+  total_size?: number;
+  /** Engine phase: connecting | retrying | merging | downloading. */
+  status?: string;
 }
 
 export interface CompletedPayload {
@@ -37,22 +41,38 @@ export interface DownloadEventHandlers {
   onCreated?: () => void;
 }
 
+const LIVE_PHASES = new Set(["connecting", "retrying", "merging", "downloading"]);
+
+function isTerminalStatus(status: DownloadItem["status"]): boolean {
+  const s = typeof status === "object" && "failed" in status ? "failed" : status;
+  return s === "paused" || s === "completed" || s === "failed";
+}
+
 /** Patch a download-list cache with updated progress for a single download. */
 export function patchDownloadProgress(
   cache: DownloadItem[] | undefined,
   id: number,
-  downloaded: number,
+  downloaded?: number,
   partDownloaded?: number[],
   resetToSingle?: boolean,
+  extra?: { totalSize?: number; status?: string },
 ): DownloadItem[] | undefined {
   if (!cache) return cache;
   return cache.map((d) => {
     if (d.id !== id) return d;
+    const totalSize = extra?.totalSize && d.total_size === 0 ? extra.totalSize : d.total_size;
     const parts =
       partDownloaded !== undefined
-        ? applyPartDownloaded(d.parts, partDownloaded, d.total_size, resetToSingle)
+        ? applyPartDownloaded(d.parts, partDownloaded, totalSize, resetToSingle)
         : d.parts;
-    return { ...d, downloaded, parts };
+    const nextDownloaded =
+      typeof downloaded === "number" && Number.isFinite(downloaded) ? downloaded : d.downloaded;
+    const phase = extra?.status;
+    const status =
+      phase && LIVE_PHASES.has(phase) && !isTerminalStatus(d.status)
+        ? (phase as DownloadItem["status"])
+        : d.status;
+    return { ...d, downloaded: nextDownloaded, parts, total_size: totalSize, status };
   });
 }
 
@@ -89,7 +109,10 @@ export function subscribeDownloadEvents(
       guard((p) => {
         if (options.progressId !== undefined && p.id !== options.progressId) return;
         queryClient.setQueryData<DownloadItem[]>(["downloads"], (old) =>
-          patchDownloadProgress(old, p.id, p.downloaded, p.parts, p.reset_to_single),
+          patchDownloadProgress(old, p.id, p.downloaded, p.parts, p.reset_to_single, {
+            totalSize: p.total_size,
+            status: p.status,
+          }),
         );
       }),
     ),

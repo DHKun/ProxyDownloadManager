@@ -1,4 +1,5 @@
-import { memo, useCallback } from "react";
+import { memo, useCallback, useRef } from "react";
+import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { useDownloads } from "../query/downloadQueries";
 import { useDownloadSpeed } from "../hooks/useDownloadSpeed";
 import { useFileIcons, iconFor } from "../hooks/useFileIcons";
@@ -8,7 +9,7 @@ import { useAppContext } from "../contexts/AppContext";
 import { useContextMenu } from "../hooks/useContextMenu";
 import { Checkbox } from "./ui/checkbox";
 import { overallPercent } from "../utils/progressMap";
-import { formatBytes, statusString, isFailed, isActiveStatus } from "../utils/format";
+import { formatBytes, statusString, isFailed, isActiveStatus, failureText } from "../utils/format";
 import { computeETA } from "../hooks/useDownloadSpeed";
 import type { DownloadItem } from "../types";
 import type { StatusFilter, TypeFilter } from "../utils/url";
@@ -20,14 +21,47 @@ interface DownloadTableProps {
   typeFilter?: TypeFilter;
 }
 
+const menuItem = "cursor-pointer rounded-sm px-3 py-1.5 text-[13px] outline-none data-[highlighted]:bg-muted";
+
+function isSegmentItem(item: DownloadItem): boolean {
+  const ct = (item.content_type || "").toLowerCase();
+  return ct.includes("mpegurl") || item.file_name.toLowerCase().endsWith(".m3u8");
+}
+
+function StatusCell({ item }: { item: DownloadItem }) {
+  const s = statusString(item.status);
+  const pct = overallPercent(item.downloaded, item.total_size, item.status);
+  const live = isActiveStatus(item.status);
+  if (s === "connecting") return <span>{t("status.connecting")}</span>;
+  if (s === "retrying" || s === "merging") {
+    const label = s === "retrying" ? t("status.retrying") : t("status.merging");
+    return <span>{item.total_size > 0 ? `${label} · ${pct}%` : label}</span>;
+  }
+  if (isFailed(item.status) || s === "failed") {
+    const { code, message } = failureText(item.status, item.error_message);
+    const label = code != null ? `${t("status.failed")} · HTTP ${code}` : t("status.failed");
+    return <span title={message || undefined}>{label}</span>;
+  }
+  if (live && item.total_size > 0) {
+    return (
+      <div className="flex items-center gap-2">
+        <Progress className="w-20" value={pct} />
+        <span className="tabular text-[12px]">{pct}%</span>
+      </div>
+    );
+  }
+  return <span>{s}</span>;
+}
+
 export default function DownloadTable({ filter, query = "", typeFilter = "all" }: DownloadTableProps) {
   const { selectedIds, selectionActions, actions } = useAppContext();
-  const { onStop, onDelete, onProperties, onRedownload } = actions;
+  const { onStop, onDelete, onProperties, onRedownload, onResume } = actions;
   const { data: downloads = [], isLoading } = useDownloads();
   const filtered = applyFilter(downloads, filter, query, typeFilter);
   const speeds = useDownloadSpeed(filtered);
   const icons = useFileIcons(filtered);
   const { menuState, menuRef, handleContext, closeMenu } = useContextMenu();
+  const anchor = useRef<number | null>(null);
 
   const selectAllChecked = filtered.length > 0 && filtered.every((d) => selectedIds.has(d.id));
   const selectAllIndeterminate = !selectAllChecked && filtered.some((d) => selectedIds.has(d.id));
@@ -35,6 +69,26 @@ export default function DownloadTable({ filter, query = "", typeFilter = "all" }
   const toggleSelectAll = () => {
     if (selectAllChecked) selectionActions.clearSelection();
     else selectionActions.select(new Set(filtered.map((d) => d.id)));
+  };
+
+  const onRowClick = (e: React.MouseEvent, id: number) => {
+    if ((e.target as HTMLElement).closest("[data-row-check]")) return;
+    const ids = filtered.map((d) => d.id);
+    if (e.shiftKey && anchor.current != null) {
+      const a = ids.indexOf(anchor.current);
+      const b = ids.indexOf(id);
+      if (a >= 0 && b >= 0) {
+        const [lo, hi] = a < b ? [a, b] : [b, a];
+        const next = new Set<number>();
+        if (e.metaKey || e.ctrlKey) selectedIds.forEach((x) => next.add(x));
+        for (let i = lo; i <= hi; i++) next.add(ids[i]!);
+        selectionActions.select(next);
+        return;
+      }
+    }
+    if (e.metaKey || e.ctrlKey) selectionActions.toggle(id);
+    else selectionActions.select(new Set([id]));
+    anchor.current = id;
   };
 
   const onDoubleClick = useCallback(async (item: DownloadItem) => {
@@ -53,24 +107,7 @@ export default function DownloadTable({ filter, query = "", typeFilter = "all" }
     );
   }
 
-  const menuItemFor = (id: number) => {
-    const item = filtered.find((d) => d.id === id);
-    if (!item) return null;
-    const s = statusString(item.status);
-    return (
-      <>
-        {isActiveStatus(item.status) && <MenuItem label={t("downloadRow.pause")} onClick={() => { closeMenu(); onStop(id); }} />}
-        {s === "paused" && <MenuItem label={t("downloadRow.resume")} onClick={() => { closeMenu(); actions.onResumeSelected(); }} />}
-        <MenuItem label={t("downloadRow.restart")} onClick={() => { closeMenu(); onRedownload(item); }} />
-        <MenuItem label={t("downloadRow.open")} onClick={() => { closeMenu(); openFile(item.save_path); }} />
-        <MenuItem label={t("downloadRow.openFolder")} onClick={() => { closeMenu(); openFolder(item.save_path); }} />
-        <MenuItem label={t("downloadRow.copyUrl")} onClick={() => { closeMenu(); navigator.clipboard.writeText(item.url); }} />
-        <MenuItem label={t("downloadRow.refreshUrl")} onClick={() => { closeMenu(); onProperties(id); }} />
-        <MenuItem label={t("downloadRow.properties")} onClick={() => { closeMenu(); onProperties(id); }} />
-        <MenuItem label={t("toolbar.delete")} danger onClick={() => { closeMenu(); onDelete([id]); }} />
-      </>
-    );
-  };
+  const menuItemFor = filtered.find((d) => d.id === menuState?.id) ?? null;
 
   return (
     <div className="relative">
@@ -82,10 +119,9 @@ export default function DownloadTable({ filter, query = "", typeFilter = "all" }
             </th>
             <th className="px-2 py-1">{t("downloadTable.fileName")}</th>
             <th className="w-[140px] px-2 py-1">{t("downloadTable.size")}</th>
-            <th className="w-[160px] px-2 py-1">{t("downloadTable.status")}</th>
+            <th className="w-[180px] px-2 py-1">{t("downloadTable.status")}</th>
             <th className="w-[90px] px-2 py-1">{t("downloadTable.speed")}</th>
             <th className="w-[90px] px-2 py-1">{t("downloadTable.remain")}</th>
-            <th className="w-[70px] px-2 py-1">{t("downloadTable.threads")}</th>
             <th className="w-[90px] px-2 py-1">{t("downloadTable.proxy")}</th>
           </tr>
         </thead>
@@ -99,27 +135,81 @@ export default function DownloadTable({ filter, query = "", typeFilter = "all" }
               speed={speeds.get(row.id)?.display ?? "—"}
               bps={speeds.get(row.id)?.bps ?? 0}
               onToggle={() => selectionActions.toggle(row.id)}
+              onClick={(e) => onRowClick(e, row.id)}
               onContext={(e) => handleContext(e, row.id)}
               onDoubleClick={() => onDoubleClick(row)}
             />
           ))}
         </tbody>
       </table>
-      {menuState && (
-        <div
-          ref={menuRef}
-          className="fixed z-20 min-w-[160px] rounded-md border border-border bg-card py-1 shadow-sm"
-          style={{ left: menuState.x, top: menuState.y }}
-        >
-          {menuItemFor(menuState.id)}
-        </div>
+      {menuState && menuItemFor && (
+        <DropdownMenu.Root open onOpenChange={(open) => { if (!open) closeMenu(); }}>
+          <DropdownMenu.Trigger asChild>
+            <button
+              type="button"
+              aria-hidden
+              tabIndex={-1}
+              className="fixed h-px w-px p-0 opacity-0"
+              style={{ left: menuState.x, top: menuState.y }}
+            />
+          </DropdownMenu.Trigger>
+          <DropdownMenu.Portal>
+            <DropdownMenu.Content
+              ref={menuRef}
+              className="z-50 min-w-[168px] rounded-md border border-border bg-card py-1 shadow-sm"
+              align="start"
+              sideOffset={2}
+            >
+              <RowMenu
+                item={menuItemFor}
+                onResume={() => onResume(menuItemFor.id)}
+                onPause={() => onStop(menuItemFor.id)}
+                onOpen={() => { void openFile(menuItemFor.save_path); }}
+                onOpenFolder={() => { void openFolder(menuItemFor.save_path); }}
+                onRedownload={() => { void onRedownload(menuItemFor); }}
+                onCopy={() => { void navigator.clipboard.writeText(menuItemFor.url); }}
+                onDetails={() => onProperties(menuItemFor.id)}
+                onDelete={() => onDelete([menuItemFor.id])}
+              />
+            </DropdownMenu.Content>
+          </DropdownMenu.Portal>
+        </DropdownMenu.Root>
       )}
     </div>
   );
 }
 
+function RowMenu({
+  item, onResume, onPause, onOpen, onOpenFolder, onRedownload, onCopy, onDetails, onDelete,
+}: {
+  item: DownloadItem;
+  onResume: () => void;
+  onPause: () => void;
+  onOpen: () => void;
+  onOpenFolder: () => void;
+  onRedownload: () => void;
+  onCopy: () => void;
+  onDetails: () => void;
+  onDelete: () => void;
+}) {
+  const s = statusString(item.status);
+  return (
+    <>
+      {s === "paused" && <DropdownMenu.Item className={menuItem} onSelect={onResume}>{t("downloadRow.resume")}</DropdownMenu.Item>}
+      {isActiveStatus(item.status) && <DropdownMenu.Item className={menuItem} onSelect={onPause}>{t("downloadRow.pause")}</DropdownMenu.Item>}
+      {item.status === "completed" && <DropdownMenu.Item className={menuItem} onSelect={onOpen}>{t("downloadRow.open")}</DropdownMenu.Item>}
+      <DropdownMenu.Item className={menuItem} onSelect={onOpenFolder}>{t("downloadRow.openFolder")}</DropdownMenu.Item>
+      <DropdownMenu.Item className={menuItem} onSelect={onRedownload}>{t("toolbar.redownload")}</DropdownMenu.Item>
+      <DropdownMenu.Item className={menuItem} onSelect={onCopy}>{t("downloadRow.copyUrl")}</DropdownMenu.Item>
+      <DropdownMenu.Item className={menuItem} onSelect={onDetails}>{t("downloadRow.details")}</DropdownMenu.Item>
+      <DropdownMenu.Separator className="my-1 h-px bg-border" />
+      <DropdownMenu.Item className={`${menuItem} text-destructive`} onSelect={onDelete}>{t("toolbar.delete")}</DropdownMenu.Item>
+    </>
+  );
+}
+
 const DownloadRow = memo(function DownloadRow({
-  item, selected, icon, speed, bps, onToggle, onContext, onDoubleClick,
+  item, selected, icon, speed, bps, onToggle, onClick, onContext, onDoubleClick,
 }: {
   item: DownloadItem;
   selected: boolean;
@@ -127,23 +217,30 @@ const DownloadRow = memo(function DownloadRow({
   speed: string;
   bps: number;
   onToggle: () => void;
+  onClick: (e: React.MouseEvent) => void;
   onContext: (e: React.MouseEvent) => void;
   onDoubleClick: () => void;
 }) {
-  const pct = overallPercent(item.downloaded, item.total_size, item.status);
   const live = isActiveStatus(item.status);
-  const size = item.total_size === 0
-    ? "—"
-    : item.status === "completed"
-      ? formatBytes(item.total_size)
-      : `${formatBytes(item.downloaded)} / ${formatBytes(item.total_size)}`;
+  const size = isSegmentItem(item)
+    ? (item.total_size > 0
+      ? t("properties.segments").replace("{done}", String(item.downloaded)).replace("{total}", String(item.total_size))
+      : "—")
+    : item.total_size === 0
+      ? "—"
+      : item.status === "completed"
+        ? formatBytes(item.total_size)
+        : `${formatBytes(item.downloaded)} / ${formatBytes(item.total_size)}`;
   return (
     <tr
       className={`border-b border-border hover:bg-muted/70 ${selected ? "bg-muted" : ""} ${live ? "row-live" : ""}`}
+      onClick={onClick}
       onContextMenu={onContext}
       onDoubleClick={onDoubleClick}
     >
-      <td className="px-2 py-1"><Checkbox checked={selected} onCheckedChange={onToggle} /></td>
+      <td className="px-2 py-1" data-row-check onClick={(e) => e.stopPropagation()}>
+        <Checkbox checked={selected} onCheckedChange={onToggle} />
+      </td>
       <td className="max-w-0 px-2 py-1">
         <div className="flex min-w-0 items-center gap-1.5">
           <img src={icon} alt="" width={16} height={16} className="shrink-0" />
@@ -151,31 +248,10 @@ const DownloadRow = memo(function DownloadRow({
         </div>
       </td>
       <td className="tabular px-2 py-1 whitespace-nowrap">{size}</td>
-      <td className="px-2 py-1">
-        {item.total_size > 0 && live ? (
-          <div className="flex items-center gap-2">
-            <Progress className="w-20" value={pct} />
-            <span className="tabular text-[12px]">{pct}%</span>
-          </div>
-        ) : (
-          <span>{isFailed(item.status) ? item.error_message || "failed" : statusString(item.status)}</span>
-        )}
-      </td>
+      <td className="px-2 py-1"><StatusCell item={item} /></td>
       <td className="tabular px-2 py-1 whitespace-nowrap">{live ? speed : "—"}</td>
       <td className="tabular px-2 py-1 whitespace-nowrap">{live ? computeETA(item, bps) : "—"}</td>
-      <td className="tabular px-2 py-1">{item.connections || "A"}</td>
       <td className="truncate px-2 py-1 text-muted-foreground">{item.proxy_name || "—"}</td>
     </tr>
   );
 });
-
-function MenuItem({ label, onClick, danger }: { label: string; onClick: () => void; danger?: boolean }) {
-  return (
-    <div
-      onClick={onClick}
-      className={`cursor-pointer px-3 py-1.5 text-[13px] hover:bg-muted ${danger ? "text-destructive" : ""}`}
-    >
-      {label}
-    </div>
-  );
-}

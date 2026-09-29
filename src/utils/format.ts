@@ -12,6 +12,16 @@ export function statusString(status: DownloadStatus): string {
   return typeof status === "object" && "failed" in status ? "failed" : status;
 }
 
+/** HTTP status embedded in an engine error, plus the full message for a tooltip. */
+export function failureText(
+  status: DownloadStatus,
+  errorMessage?: string,
+): { code: number | null; message: string } {
+  const message = getErrorMessage(status) || errorMessage || "";
+  const match = message.match(/HTTP\s+(\d{3})/i);
+  return { code: match ? Number(match[1]) : null, message };
+}
+
 export function isActiveStatus(status: DownloadStatus): boolean {
   const s = statusString(status);
   return s === "downloading" || s === "connecting" || s === "retrying" || s === "merging";

@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useStartDownload, useSettings } from "./query/downloadQueries";
@@ -20,17 +20,26 @@ export default function NewDownloadWindow() {
   const [filename, setFilename] = useState("");
   const [autoFilled, setAutoFilled] = useState(false);
   const [proxyName, setProxyName] = useState(loadedSettings?.default_proxy ?? "");
-  const [connections, setConnections] = useState(0);
+  const [connectionMode, setConnectionMode] = useState<"auto" | "manual">("auto");
+  const [manualConnections, setManualConnections] = useState(8);
+  const [suggested, setSuggested] = useState(0);
   const [savePath, setSavePath] = useState(loadedSettings?.download_dir ?? "");
   const [headers, setHeaders] = useState<Record<string, string>>({});
   const [probe, setProbe] = useState<ProbeInfo | null>(null);
+  const [probeError, setProbeError] = useState<string | null>(null);
   const [probing, setProbing] = useState(false);
+  const probeSeq = useRef(0);
+  const lastProbeKey = useRef("");
+  const timer = useRef<number | null>(null);
+  const filenameRef = useRef(filename);
+  const autoFilledRef = useRef(autoFilled);
+  filenameRef.current = filename;
+  autoFilledRef.current = autoFilled;
 
   useEffect(() => {
     if (loadedSettings) {
       setLanguage(loadedSettings.language || "en");
       setProxyName(loadedSettings.default_proxy);
-      setConnections(loadedSettings.max_connections);
       setSavePath(loadedSettings.download_dir);
     }
   }, [loadedSettings]);
@@ -49,7 +58,10 @@ export default function NewDownloadWindow() {
       const fn = extractFilename(u);
       if (fn) { setFilename(fn); setAutoFilled(true); }
     }
-    if (req.connections) setConnections(req.connections);
+    if (req.connections) {
+      setConnectionMode("manual");
+      setManualConnections(req.connections);
+    }
     const nextHeaders = { ...(req.headers || {}) };
     if (req.cookies && !nextHeaders.Cookie) nextHeaders.Cookie = req.cookies;
     if (req.referrer && !nextHeaders.Referer) nextHeaders.Referer = req.referrer;
@@ -82,26 +94,52 @@ export default function NewDownloadWindow() {
     };
   }, []);
 
-  useEffect(() => {
-    if (!url.startsWith("http")) { setProbe(null); return; }
-    const handle = window.setTimeout(async () => {
-      setProbing(true);
-      try {
-        const info = await tauriClient.probeUrl(url, headers, proxyName);
-        setProbe(info);
-        if (!filename || autoFilled) {
-          setFilename(info.file_name);
-          setAutoFilled(true);
-        }
-        if (connections === 0) setConnections(info.suggested_connections);
-      } catch {
-        setProbe(null);
-      } finally {
-        setProbing(false);
+  const probeKey = `${url}\n${proxyName}\n${JSON.stringify(headers)}`;
+
+  const probeNow = useCallback(async () => {
+    if (!url.startsWith("http")) return "skip" as const;
+    const key = `${url}\n${proxyName}\n${JSON.stringify(headers)}`;
+    const seq = ++probeSeq.current;
+    setProbing(true);
+    setProbeError(null);
+    try {
+      const info = await tauriClient.probeUrl(url, headers, proxyName);
+      if (seq !== probeSeq.current) return "stale" as const;
+      setProbe(info);
+      setSuggested(info.suggested_connections || 0);
+      lastProbeKey.current = key;
+      if (!filenameRef.current || autoFilledRef.current) {
+        setFilename(info.file_name);
+        setAutoFilled(true);
       }
-    }, 400);
-    return () => window.clearTimeout(handle);
-  }, [url, proxyName, headers]);
+      return "ok" as const;
+    } catch (err) {
+      if (seq !== probeSeq.current) return "stale" as const;
+      setProbe(null);
+      setProbeError(err instanceof Error ? err.message : String(err));
+      lastProbeKey.current = "";
+      return "error" as const;
+    } finally {
+      if (seq === probeSeq.current) setProbing(false);
+    }
+  }, [url, headers, proxyName]);
+
+  useEffect(() => {
+    if (timer.current) window.clearTimeout(timer.current);
+    if (!url.startsWith("http")) {
+      probeSeq.current += 1;
+      setProbe(null);
+      setProbeError(null);
+      setProbing(false);
+      lastProbeKey.current = "";
+      return;
+    }
+    if (probeKey === lastProbeKey.current) return;
+    timer.current = window.setTimeout(() => { void probeNow(); }, 550);
+    return () => {
+      if (timer.current) window.clearTimeout(timer.current);
+    };
+  }, [probeKey, url, probeNow]);
 
   const handleUrlChange = useCallback((value: string) => {
     setUrl(value);
@@ -113,6 +151,8 @@ export default function NewDownloadWindow() {
     const dir = await open({ directory: true, multiple: false, title: t("newDownload.saveTo") });
     if (dir) setSavePath(dir as string);
   };
+
+  const connections = connectionMode === "auto" ? 0 : manualConnections;
 
   const submit = async (paused: boolean) => {
     if (!url) return;
@@ -145,11 +185,32 @@ export default function NewDownloadWindow() {
     }
   };
 
+  const onUrlKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key !== "Enter" || e.nativeEvent.isComposing) return;
+    e.preventDefault();
+    if (!url.startsWith("http")) return;
+    if (lastProbeKey.current === probeKey && probe && !probing) {
+      void submit(false);
+      return;
+    }
+    if (timer.current) window.clearTimeout(timer.current);
+    void probeNow();
+  };
+
+  const autoLabel = suggested > 0
+    ? t("newDownload.autoSuggested").replace("{n}", String(suggested))
+    : t("newDownload.auto");
+
   return (
     <div className="flex h-full flex-col gap-3 overflow-auto p-3">
       <div>
         <Label>{t("newDownload.url")}</Label>
-        <Input value={url} onChange={(e) => handleUrlChange(e.target.value)} placeholder="https://example.com/file.zip" />
+        <Input
+          value={url}
+          onChange={(e) => handleUrlChange(e.target.value)}
+          onKeyDown={onUrlKeyDown}
+          placeholder="https://example.com/file.zip"
+        />
       </div>
       <div>
         <Label>{t("newDownload.filename")}</Label>
@@ -165,28 +226,45 @@ export default function NewDownloadWindow() {
       <div className="grid grid-cols-2 gap-2">
         <div>
           <Label>{t("newDownload.connections")}</Label>
-          <Select value={String(connections)} onChange={(e) => setConnections(Number(e.target.value))}>
-            <option value="0">Auto</option>
+          <Select
+            value={connectionMode === "auto" ? "0" : String(manualConnections)}
+            onChange={(e) => {
+              const n = Number(e.target.value);
+              if (n === 0) setConnectionMode("auto");
+              else {
+                setConnectionMode("manual");
+                setManualConnections(n);
+              }
+            }}
+          >
+            <option value="0">{autoLabel}</option>
             {[1, 4, 8, 16, 32, 64].map((n) => <option key={n} value={n}>{n}</option>)}
           </Select>
         </div>
         <div>
           <Label>{t("newDownload.proxy")}</Label>
           <Select value={proxyName} onChange={(e) => setProxyName(e.target.value)}>
-            <option value="">{t("newDownload.noProxy")}</option>
+            <option value="">{t("newDownload.direct")}</option>
             {Object.keys(proxies).map((name) => <option key={name} value={name}>{name}</option>)}
           </Select>
         </div>
       </div>
       <div className="rounded-md border border-border bg-muted p-2 text-[12px]">
+        {!url.startsWith("http") && !probeError && <div className="text-muted-foreground">{t("newDownload.probeIdle")}</div>}
         {probing && <div>{t("newDownload.probing")}</div>}
-        {probe && (
+        {probe && !probing && (
           <div className="grid grid-cols-2 gap-x-3 gap-y-1">
             <span className="text-muted-foreground">{t("newDownload.size")}</span><span>{probe.file_size ? formatBytes(probe.file_size) : "—"}</span>
-            <span className="text-muted-foreground">{t("newDownload.type")}</span><span>{probe.content_type || "—"}</span>
+            <span className="text-muted-foreground">{t("newDownload.type")}</span><span className="truncate">{probe.content_type || "—"}</span>
             <span className="text-muted-foreground">{t("newDownload.range")}</span><span>{probe.supports_range ? t("properties.yes") : t("properties.no")}</span>
-            <span className="text-muted-foreground">{t("newDownload.suggested")}</span><span>{probe.suggested_connections}</span>
             <span className="text-muted-foreground">{t("newDownload.finalUrl")}</span><span className="truncate">{probe.final_url || url}</span>
+          </div>
+        )}
+        {probeError && !probing && (
+          <div className="flex flex-col gap-0.5">
+            <div>{t("newDownload.probeFailed")}</div>
+            <div className="text-destructive">{probeError}</div>
+            <div className="text-muted-foreground">{t("newDownload.probeFailedHint")}</div>
           </div>
         )}
         {Object.keys(headers).length > 0 && (

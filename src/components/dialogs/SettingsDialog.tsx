@@ -17,16 +17,20 @@ interface SettingsDialogProps {
   onClose: () => void;
 }
 
+function SectionTitle({ children }: { children: string }) {
+  return <div className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">{children}</div>;
+}
+
 export default function SettingsDialog({ onClose }: SettingsDialogProps) {
   const form = useSettingsForm(onClose);
   const { settings, setSettings } = form;
   if (!settings) return null;
 
   return (
-    <AppDialog title={t("settings.title")} onClose={onClose} width="max-w-4xl">
-      <div className="grid max-h-[70vh] grid-cols-2 gap-3 overflow-auto p-3">
-        <div className="flex flex-col gap-2">
-          <div className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">{t("settings.download")}</div>
+    <AppDialog title={t("settings.title")} onClose={onClose} width="max-w-3xl">
+      <div className="flex max-h-[70vh] flex-col gap-4 overflow-auto p-3">
+        <section className="flex flex-col gap-2">
+          <SectionTitle>{t("settings.download")}</SectionTitle>
           <Label>{t("settings.downloadDir")}</Label>
           <div className="flex gap-1">
             <Input value={settings.download_dir} onChange={(e) => setSettings({ ...settings, download_dir: e.target.value })} />
@@ -46,8 +50,6 @@ export default function SettingsDialog({ onClose }: SettingsDialogProps) {
               </Select>
             </div>
           </div>
-          <Label>{t("settings.userAgent")}</Label>
-          <Input value={settings.user_agent} onChange={(e) => setSettings({ ...settings, user_agent: e.target.value })} />
           <Label>{t("settings.fileConflict")}</Label>
           <Select value={settings.file_conflict || "rename"} onChange={(e) => setSettings({ ...settings, file_conflict: e.target.value as FileConflictPolicy })}>
             <option value="rename">{t("settings.conflictRename")}</option>
@@ -55,31 +57,11 @@ export default function SettingsDialog({ onClose }: SettingsDialogProps) {
             <option value="ask">{t("settings.conflictAsk")}</option>
             <option value="skip">{t("settings.conflictSkip")}</option>
           </Select>
-          <Label>{t("settings.globalRate")}</Label>
-          <Input type="number" value={String(settings.global_rate_limit)} onChange={(e) => setSettings({ ...settings, global_rate_limit: Number(e.target.value) })} />
-        </div>
-        <div className="flex flex-col gap-2">
-          <div className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">{t("settings.storage")}</div>
-          <Label>{t("settings.homeDir")}</Label>
-          <div className="flex gap-1">
-            <Input value={settings.home_dir} onChange={(e) => setSettings({ ...settings, home_dir: e.target.value })} />
-            <Button size="sm" onClick={() => form.browseFolder("home_dir")}>{t("settings.browse")}</Button>
-          </div>
-          <label className="flex items-center gap-2 text-[13px]"><Checkbox checked={settings.launch_at_startup} onCheckedChange={(v) => setSettings({ ...settings, launch_at_startup: v === true })} /> {t("settings.launchStartup")}</label>
-          <label className="flex items-center gap-2 text-[13px]"><Checkbox checked={settings.silent_startup} disabled={!settings.launch_at_startup} onCheckedChange={(v) => setSettings({ ...settings, silent_startup: v === true })} /> {t("settings.silentStartup")}</label>
-          <label className="flex items-center gap-2 text-[13px]"><Checkbox checked={settings.danger_accept_invalid_certs} onCheckedChange={(v) => setSettings({ ...settings, danger_accept_invalid_certs: v === true })} /> {t("settings.tlsSkip")}</label>
-          <Label>{t("settings.language")}</Label>
-          <Select value={settings.language} onChange={(e) => setSettings({ ...settings, language: e.target.value })}>
-            <option value="en">{t("settings.english")}</option>
-            <option value="zh">{t("settings.chinese")}</option>
-          </Select>
-          <Label>{t("settings.shortcutLabel")}</Label>
-          <Input value={settings.global_shortcut} onChange={(e) => setSettings({ ...settings, global_shortcut: e.target.value })} />
-          <p className="text-[11px] text-muted-foreground">{t("settings.shortcutCaption")}</p>
-        </div>
-        <div className="col-span-2">
-          <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">{t("settings.proxy")}</div>
-          <div className="mb-2 max-w-xs">
+        </section>
+
+        <section className="flex flex-col gap-2">
+          <SectionTitle>{t("settings.network")}</SectionTitle>
+          <div className="max-w-xs">
             <Label>{t("settings.defaultProxy")}</Label>
             <Select
               value={settings.default_proxy}
@@ -104,7 +86,34 @@ export default function SettingsDialog({ onClose }: SettingsDialogProps) {
             onStartEdit={form.startEditProxy}
             onRemove={form.removeProxy}
           />
-        </div>
+          <Label>{t("settings.globalRate")}</Label>
+          <Input type="number" value={String(settings.global_rate_limit)} onChange={(e) => setSettings({ ...settings, global_rate_limit: Number(e.target.value) })} />
+          <Label>{t("settings.userAgent")}</Label>
+          <Input value={settings.user_agent} onChange={(e) => setSettings({ ...settings, user_agent: e.target.value })} />
+          <label className="flex items-center gap-2 text-[13px]">
+            <Checkbox checked={settings.danger_accept_invalid_certs} onCheckedChange={(v) => setSettings({ ...settings, danger_accept_invalid_certs: v === true })} />
+            {t("settings.tlsSkip")}
+          </label>
+        </section>
+
+        <section className="flex flex-col gap-2">
+          <SectionTitle>{t("settings.app")}</SectionTitle>
+          <Label>{t("settings.homeDir")}</Label>
+          <div className="flex gap-1">
+            <Input value={settings.home_dir} onChange={(e) => setSettings({ ...settings, home_dir: e.target.value })} />
+            <Button size="sm" onClick={() => form.browseFolder("home_dir")}>{t("settings.browse")}</Button>
+          </div>
+          <label className="flex items-center gap-2 text-[13px]"><Checkbox checked={settings.launch_at_startup} onCheckedChange={(v) => setSettings({ ...settings, launch_at_startup: v === true })} /> {t("settings.launchStartup")}</label>
+          <label className="flex items-center gap-2 text-[13px]"><Checkbox checked={settings.silent_startup} disabled={!settings.launch_at_startup} onCheckedChange={(v) => setSettings({ ...settings, silent_startup: v === true })} /> {t("settings.silentStartup")}</label>
+          <Label>{t("settings.language")}</Label>
+          <Select value={settings.language} onChange={(e) => setSettings({ ...settings, language: e.target.value })}>
+            <option value="en">{t("settings.english")}</option>
+            <option value="zh">{t("settings.chinese")}</option>
+          </Select>
+          <Label>{t("settings.shortcutLabel")}</Label>
+          <Input value={settings.global_shortcut} onChange={(e) => setSettings({ ...settings, global_shortcut: e.target.value })} />
+          <p className="text-[11px] text-muted-foreground">{t("settings.shortcutCaption")}</p>
+        </section>
       </div>
       <div className="flex justify-end gap-2 border-t border-border p-3">
         <Button onClick={onClose}>{t("settings.cancel")}</Button>

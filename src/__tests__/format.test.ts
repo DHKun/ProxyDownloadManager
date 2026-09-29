@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { isFailed, getErrorMessage, statusString, statusColor, formatTimestamp } from "../utils/format";
+import { isFailed, getErrorMessage, statusString, statusColor, formatTimestamp, failureText } from "../utils/format";
 
 describe("isFailed", () => {
   it("returns true for failed status", () => {
@@ -22,6 +22,20 @@ describe("getErrorMessage", () => {
   it("returns undefined for non-failed statuses", () => {
     expect(getErrorMessage("downloading")).toBeUndefined();
     expect(getErrorMessage("completed")).toBeUndefined();
+  });
+});
+
+describe("failureText", () => {
+  it("reads an HTTP code from the engine message", () => {
+    expect(failureText({ failed: "HTTP 403" })).toEqual({ code: 403, message: "HTTP 403" });
+    expect(failureText("failed", "HTTP 404 not found").code).toBe(404);
+  });
+
+  it("returns the message when no code is present", () => {
+    expect(failureText({ failed: "connection reset" })).toEqual({
+      code: null,
+      message: "connection reset",
+    });
   });
 });
 

@@ -17,6 +17,7 @@ export interface AppActions {
   onPauseSelected: () => void;
   onDeleteSelected: () => void;
   onStop: (id: number) => void;
+  onResume: (id: number) => void;
   onDelete: (ids: number[]) => void;
   onProperties: (id: number) => void;
   onRedownload: (item: DownloadItem) => void;

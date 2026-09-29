@@ -17,7 +17,7 @@ import { emitToListeners } from "./tauri-mocks";
 import { AppProvider, useAppContext, type AppActions } from "../src/contexts/AppContext";
 import { useDialog } from "../src/hooks/useDialog";
 import { useSelection } from "../src/hooks/useSelection";
-import { isFailed } from "../src/utils/download";
+import { isActiveStatus } from "../src/utils/format";
 import type { DownloadItem } from "../src/types";
 
 const queryClient = new QueryClient({
@@ -34,21 +34,16 @@ type ExtraDialog =
   | null;
 
 function DemoInner({ extra, setExtra }: { extra: ExtraDialog; setExtra: (d: ExtraDialog) => void }) {
-  const { dialog, dialogActions, selectedIds } = useAppContext();
-  const { data: downloads = [] } = useDownloads();
+  const { dialog, dialogActions } = useAppContext();
   const { settings } = useSettings();
 
   useEffect(() => {
     if (settings) setLanguage(settings.language || "zh");
   }, [settings]);
 
-  const selectedForRedownload = selectedIds.size === 1
-    ? downloads.find((d) => selectedIds.has(d.id) && (d.status === "completed" || isFailed(d.status)))
-    : undefined;
-
   return (
     <div className="demo-app h-full">
-      <Layout className="h-full" onRedownloadItem={selectedForRedownload} />
+      <Layout className="h-full" />
       <DialogRenderer
         dialog={dialog}
         onClose={() => dialogActions.closeDialog()}
@@ -115,8 +110,11 @@ function DemoApp() {
         .forEach((d) => resumeDownload.mutate(d.id));
     },
     onPauseSelected: () => {
-      downloads.filter((d) => selection.selectedIds.has(d.id) && d.status === "downloading")
+      downloads.filter((d) => selection.selectedIds.has(d.id) && isActiveStatus(d.status))
         .forEach((d) => pauseDownload.mutate(d.id));
+    },
+    onResume: (id: number) => {
+      resumeDownload.mutate(id);
     },
     onDeleteSelected: () => {
       if (selection.selectedIds.size) dialog.openDelete(Array.from(selection.selectedIds));

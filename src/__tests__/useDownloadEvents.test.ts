@@ -51,6 +51,33 @@ describe("patchDownloadProgress", () => {
     expect(patchDownloadProgress([], 1, 500)).toEqual([]);
   });
 
+  it("keeps bytes when a phase-only event arrives", () => {
+    const cache = [makeItem(1, 400)];
+    const result = patchDownloadProgress(cache, 1, undefined, undefined, false, { status: "retrying" });
+    expect(result?.[0].downloaded).toBe(400);
+    expect(result?.[0].status).toBe("retrying");
+  });
+
+  it("does not let a phase event overwrite pause", () => {
+    const item = makeItem(1, 400);
+    item.status = "paused";
+    const result = patchDownloadProgress([item], 1, undefined, undefined, false, { status: "downloading" });
+    expect(result?.[0].status).toBe("paused");
+    expect(result?.[0].downloaded).toBe(400);
+  });
+
+  it("fills an unknown total without replacing a known size", () => {
+    const unknown = makeItem(1, 2);
+    unknown.total_size = 0;
+    const known = makeItem(2, 10);
+    const result = patchDownloadProgress([unknown, known], 1, undefined, undefined, false, { totalSize: 40 });
+    expect(result?.[0].total_size).toBe(40);
+    expect(result?.[0].downloaded).toBe(2);
+    const untouched = patchDownloadProgress(result, 2, 11, undefined, false, { totalSize: 99 });
+    expect(untouched?.[1].total_size).toBe(1000);
+    expect(untouched?.[1].downloaded).toBe(11);
+  });
+
   it("updates part downloaded when provided", () => {
     const item = makeItem(1, 0);
     item.parts = [

@@ -12,6 +12,7 @@ const zh: Translations = {
     about: "关于",
     extension: "浏览器",
     quit: "退出",
+    more: "更多",
   },
   sidebar: {
     filters: "筛选",
@@ -28,6 +29,7 @@ const zh: Translations = {
     typeAudio: "音频",
     typeDocument: "文档",
     typeOther: "其他",
+    filter: "筛选",
   },
   rateLimit: {
     unlimited: "不限速",
@@ -44,6 +46,12 @@ const zh: Translations = {
     copyUrl: "复制链接",
     refreshUrl: "更新链接",
     properties: "属性",
+  },
+  status: {
+    connecting: "连接中…",
+    retrying: "重试中",
+    merging: "合并中",
+    failed: "失败",
   },
   downloadTable: {
     loading: "加载中...",
@@ -85,10 +93,16 @@ const zh: Translations = {
     refreshUrl: "更新链接",
     newUrl: "新链接",
     authHidden: "请求凭证已保存，界面不显示明文。",
+    segments: "{done} / {total} 个分片",
+    resumeRestarts: "暂停后继续 = 重新开始",
+    error: "错误",
+    eta: "剩余时间",
   },
   settings: {
     title: "设置",
     download: "下载",
+    network: "网络",
+    app: "应用",
     downloadDir: "下载目录",
     browse: "浏览",
     maxThreads: "最大线程",
@@ -153,6 +167,12 @@ const zh: Translations = {
     finalUrl: "最终地址",
     suggested: "建议连接数",
     browse: "浏览",
+    probeIdle: "等待输入",
+    probeFailed: "无法探测文件信息",
+    probeFailedHint: "仍可直接开始下载",
+    direct: "直连",
+    auto: "自动",
+    autoSuggested: "自动 ({n})",
   },
   log: {
     title: "日志",

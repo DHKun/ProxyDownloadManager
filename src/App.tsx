@@ -6,7 +6,7 @@ import { useSelection, type SelectionActions } from "./hooks/useSelection";
 import { usePauseDownload, useResumeDownload, useDownloads, useSettings, useRedownloadDownload } from "./query/downloadQueries";
 import { useDownloadEvents } from "./hooks/useDownloadEvents";
 import { useWindowManager } from "./hooks/useWindowManager";
-import { isFailed } from "./utils/download";
+import { isActiveStatus } from "./utils/format";
 import { useQueryClient } from "@tanstack/react-query";
 import { setLanguage } from "./i18n";
 import { tauriClient } from "./tauriClient";
@@ -14,11 +14,10 @@ import type { DownloadItem } from "./types";
 import { AppProvider, useAppContext, type AppActions } from "./contexts/AppContext";
 
 function AppInner() {
-  const { dialog, dialogActions, selectedIds } = useAppContext();
+  const { dialog, dialogActions } = useAppContext();
   const { openNewDownload } = useWindowManager();
   const { settings: loadedSettings } = useSettings();
   const queryClient = useQueryClient();
-  const { data: downloads = [] } = useDownloads();
 
   useEffect(() => {
     if (loadedSettings) {
@@ -28,10 +27,6 @@ function AppInner() {
 
   useDownloadEvents({ queryClient });
 
-  const selectedForRedownload = selectedIds.size === 1
-    ? downloads.find((d) => selectedIds.has(d.id) && (d.status === "completed" || isFailed(d.status)))
-    : undefined;
-
   const handleDialogClose = () => {
     // Keep multi-select checks after dialogs/actions (pause, settings, cancel delete, etc.)
     dialogActions.closeDialog();
@@ -39,7 +34,7 @@ function AppInner() {
 
   return (
     <>
-      <Layout onRedownloadItem={selectedForRedownload} />
+      <Layout />
       <DialogRenderer dialog={dialog} onClose={handleDialogClose} onDownloadUpdate={(url) => openNewDownload(url)} />
     </>
   );
@@ -68,8 +63,11 @@ function useActions(dialogActs: DialogActionTypes, selectActs: SelectionActions,
       // Keep selection so user can chain actions (pause → resume → delete, etc.)
     },
     onPauseSelected: () => {
-      const items = downloads.filter((d) => selectedIds.has(d.id) && d.status === "downloading");
+      const items = downloads.filter((d) => selectedIds.has(d.id) && isActiveStatus(d.status));
       for (const d of items) pauseDownload.mutate(d.id);
+    },
+    onResume: (id: number) => {
+      void resumeDownload.mutateAsync(id);
     },
     onDeleteSelected: () => {
       if (selectedIds.size === 0) return;
