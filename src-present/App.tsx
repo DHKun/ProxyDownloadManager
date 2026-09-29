@@ -26,7 +26,7 @@ const queryClient = new QueryClient({
 
 const RELEASE = "https://github.com/fb0sh/ProxyDownloadManager/releases/latest";
 const SOURCE = "https://github.com/fb0sh/ProxyDownloadManager";
-const VERSION = "0.16.2";
+const VERSION = "0.16.3";
 
 type ExtraDialog =
   | { type: "newDownload" }
