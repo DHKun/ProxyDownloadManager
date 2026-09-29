@@ -1,3 +1,5 @@
+Archived historical design. Do not use as implementation reference.
+
 # ProxyDM 完整设计文档
 
 > 基于现有 Rust 代码库与 Surge 下载引擎设计合并而成

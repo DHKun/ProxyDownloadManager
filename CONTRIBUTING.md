@@ -124,7 +124,7 @@ Browser Extension                Desktop App
 | `components/DownloadTable.tsx` | Download list with context menu |
 | `components/dialogs/` | All dialogs: Extension, Log, NewDownload, Properties, Settings, etc. |
 | `i18n/` | Translation files (`en.ts`, `zh.ts` + index) |
-| `stores/` | Zustand stores for UI state |
+| `query/` | TanStack Query hooks for downloads and settings |
 
 ## Coding Guidelines
 

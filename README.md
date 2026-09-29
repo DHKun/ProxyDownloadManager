@@ -2,7 +2,7 @@
 
 > 多代理下载管理器 — 基于 Tauri 2 + React 19 构建。
 
-ProxyDownloadManager 是一款开源的多代理下载工具。每个下载任务可独立选择 HTTP / SOCKS5 代理，支持多候选代理自动切换。浏览器扩展一键拦截，多线程并发加速，断点续传不中断。
+ProxyDownloadManager 是一款开源的多代理下载工具。每个下载任务可独立选择 HTTP / SOCKS5 代理。浏览器扩展一键拦截，多线程并发加速，支持 Range 的任务可以断点续传。
 
 ## 🚀 在线演示
 
@@ -12,11 +12,12 @@ ProxyDownloadManager 是一款开源的多代理下载工具。每个下载任�
 
 ## 特性
 
-- **每下载独立选代理** — 每个任务可选择不同代理（HTTP / SOCKS5），支持多候选代理自动切换
-- **多线程并发下载** — 单任务最高 64 线程并行下载，自动根据文件大小调整连接数
-- **断点续传** — 支持 HTTP `Range` 请求，中断后自动恢复
+- **每下载独立选代理** — 每个任务可选择直连或一个已配置的 HTTP / SOCKS5 代理
+- **多线程并发下载** — 支持 Range 的文件按分块并行下载，连接数可选 Auto 或手动（最高 64）
+- **断点续传** — 服务器返回合法 `Content-Range` 时从已写入的字节继续；不支持 Range 的任务暂停后从头开始
+- **HLS** — 普通（未加密）m3u8 按分片下载后合并；加密和 DRM 播放列表会拒绝
 - **浏览器扩展联动** — Chrome / Edge / Firefox 扩展，点击下载拦截或右键交给桌面端
-- **重试机制** — 下载失败自动切换代理和 User-Agent 重试
+- **重试** — 单个分块失败会按退避重试，次数用尽后任务失败并保留已下载部分
 - **重复检测** — 文件已存在时提示，缺失时自动重新下载
 - **下载日志** — 颜色分级日志，应用内可查看
 - **系统托盘** — 后台下载、开机自启、通知推送
@@ -42,7 +43,7 @@ ProxyDownloadManager 是一款开源的多代理下载工具。每个下载任�
 | 平台 | 格式 |
 |------|------|
 | macOS | `.dmg` |
-| Windows | `.exe` / `.msi` |
+| Windows | `.exe` (NSIS) |
 | Linux | `.deb` / `.rpm` / `.AppImage` |
 
 ## 浏览器扩展
@@ -110,27 +111,27 @@ pnpm tauri dev
 │   │   ├── useContextMenu.ts         # 右键菜单状态
 │   │   └── useWindowManager.ts       # Tauri 窗口创建
 │   ├── contexts/AppContext.tsx        # 全局状态 + actions context
+│   ├── query/                        # TanStack Query（下载列表、设置）
 │   ├── utils/
 │   │   ├── format.ts                 # formatBytes、statusString 等纯函数
 │   │   ├── url.ts                    # looksLikeDownloadUrl、extractFilename
 │   │   └── file.ts                   # openFile、openFolder（Tauri IPC）
 │   ├── constants/events.json         # 事件名定义（与 Rust 共享）
 │   ├── i18n/                         # 中英文翻译
-│   ├── stores/                       # Zustand 状态管理
 │   └── App.tsx                       # 根组件
 ├── src-tauri/                        # Rust 后端
 │   └── src/
 │       ├── types/                    # 类型定义（error/download/config/event 子模块）
-│       ├── engine/                   # 下载引擎（concurrent.rs + file_io.rs + task_download.rs + chunk.rs）
-│       ├── worker.rs                 # 工作池（含全局/单任务限速）
+│       ├── engine/                   # ConcurrentDownloader、SingleDownloader、HlsDownloader
+│       ├── worker.rs                 # WorkerPool（排队、取消、限速、连接数）
 │       ├── network/                  # HTTP 客户端池、MultiLimiter 速率限制
-│       ├── state/                    # gob.rs（全局状态）、db.rs（SQLite）、runtime.rs
-│       ├── services/                 # SettingsService、NetworkService
-│       ├── probe.rs                  # URL 探测 + mock 测试
+│       ├── services/                 # 设置与网络相关的应用服务
+│       ├── state/                    # ledger.rs（进度）、gob.rs、db.rs（SQLite）
+│       ├── probe.rs                  # URL 探测
 │       ├── filename.rs               # 文件名提取（URL + Content-Disposition）
-│       ├── logger.rs                 # log crate 集成，统一日志
+│       ├── logger.rs                 # log crate，缓冲写入 ~/.ProxyDM/logs/proxydm.log
 │       ├── event_bus.rs              # Tauri 前端事件桥接
-│       ├── download_manager.rs       # 下载编排器（ facade 模式）
+│       ├── download_manager.rs       # 下载编排（探测、建任务、暂停/恢复/完成）
 │       ├── cmd.rs                    # Tauri IPC 命令
 │       └── lib.rs                    # 应用启动、插件注册
 ├── browsers-extension/               # 浏览器扩展（Chrome/Edge/Firefox）
@@ -155,7 +156,7 @@ pnpm tauri build
 | 状态管理   | [TanStack Query](https://tanstack.com/query) |
 | 后端      | [Rust](https://www.rustlang.org/)、[tokio](https://tokio.rs/)、[reqwest 0.12](https://docs.rs/reqwest/) |
 | 存储      | SQLite via [rusqlite](https://github.com/rusqlite/rusqlite) |
-| 日志      | [log](https://docs.rs/log/) crate（统一 `log::info!` / `log::error!`，输出到 `~/Library/Logs/ProxyDM/proxydm.log`）|
+| 日志      | [log](https://docs.rs/log/) crate（`log::info!` / `log::error!`，输出到 `~/.ProxyDM/logs/proxydm.log`）|
 | 代理      | HTTP / SOCKS5 via `reqwest` |
 | 扩展      | Chrome / Edge / Firefox MV3 |
 
