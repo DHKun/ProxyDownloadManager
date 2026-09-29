@@ -274,6 +274,7 @@ pub fn run() {
             cmd::start_download,
             cmd::probe_url,
             cmd::set_download_connections,
+            cmd::set_download_proxy,
             cmd::set_download_rate_limit,
             cmd::set_global_rate_limit,
             cmd::refresh_download_url,

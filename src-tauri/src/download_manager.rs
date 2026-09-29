@@ -439,6 +439,12 @@ impl DownloadManager {
         Ok(())
     }
 
+    /// Store the proxy name used on the next resume. The live worker keeps its
+    /// current client until then.
+    pub fn set_stored_proxy(&self, id: u64, proxy_name: String) -> PdmResult<()> {
+        self.ledger.update_proxy_name(id, proxy_name)
+    }
+
     pub async fn set_runtime_rate_limit(&self, id: u64, rate_limit_bps: u64) -> PdmResult<()> {
         self.ledger.update_rate_limit(id, rate_limit_bps)?;
         let _ = self

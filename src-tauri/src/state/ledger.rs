@@ -462,6 +462,12 @@ impl ProgressLedger {
         self.db.update_download(&item)
     }
 
+    pub fn update_proxy_name(&self, id: u64, proxy_name: String) -> PdmResult<()> {
+        let mut item = self.db.get_by_id(id)?.ok_or(PdmError::NotFound(id))?;
+        item.proxy_name = proxy_name;
+        self.db.update_download(&item)
+    }
+
     pub fn find_active_duplicate(&self, url: &str, save_path: &str) -> PdmResult<Option<u64>> {
         let items = self.db.list_downloads()?;
         Ok(items.into_iter().find_map(|i| {

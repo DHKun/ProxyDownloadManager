@@ -5,7 +5,7 @@ import {
 } from "../utils/progressMap";
 import type { DownloadPart } from "../types";
 import { patchDownloadProgress } from "../downloadEvents";
-import { cellPercents, overallPercent } from "../utils/progressMap";
+import { cellPercents, connectionSegments, overallPercent } from "../utils/progressMap";
 import type { DownloadItem } from "../types";
 
 function part(index: number, start: number, end: number, downloaded = 0): DownloadPart {
@@ -140,5 +140,23 @@ describe("threadBars", () => {
     expect(threadBars([], 0)).toEqual([]);
     expect(threadBars([], 4, "completed").map((b) => b.percent)).toEqual([100, 100, 100, 100]);
     expect(threadBars([part(0, 0, 100, 40)], 0, "completed")[0]!.percent).toBe(100);
+  });
+});
+
+describe("connectionSegments", () => {
+  it("uses real range widths and keeps failed progress", () => {
+    const segs = connectionSegments(
+      [part(0, 0, 100, 100), part(1, 100, 300, 50)],
+      4,
+      "downloading",
+    );
+    expect(segs.map((s) => s.percent)).toEqual([100, 25]);
+    expect(segs.map((s) => s.weight)).toEqual([100, 200]);
+  });
+
+  it("fills every slice once completed, and falls back to equal connections", () => {
+    expect(connectionSegments([part(0, 0, 80, 10)], 4, "completed")[0]!.percent).toBe(100);
+    expect(connectionSegments([], 3, "paused").map((s) => s.percent)).toEqual([0, 0, 0]);
+    expect(connectionSegments([], 0, "downloading")).toEqual([]);
   });
 });

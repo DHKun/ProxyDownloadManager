@@ -83,9 +83,9 @@ const mockDownloads: DownloadItem[] = [
   },
   {
     id: 5,
-    url: "https://github.com/fb0sh/ProxyDownloadManager/releases/download/v0.13.2/ProxyDownloadManager_0.13.2_aarch64.dmg",
-    file_name: "ProxyDownloadManager_0.13.2_aarch64.dmg",
-    save_path: "/Downloads/ProxyDownloadManager_0.13.2_aarch64.dmg",
+    url: "https://github.com/fb0sh/ProxyDownloadManager/releases/latest/download/ProxyDownloadManager_aarch64.dmg",
+    file_name: "ProxyDownloadManager_aarch64.dmg",
+    save_path: "/Downloads/ProxyDownloadManager_aarch64.dmg",
     total_size: 18582912,
     downloaded: 18582912,
     status: "completed",
@@ -231,6 +231,11 @@ async function invoke(command: string, args?: Record<string, any>): Promise<any>
     case "set_global_rate_limit":
       defaultSettings.global_rate_limit = args?.rateLimitBps ?? 0;
       return;
+    case "set_download_proxy": {
+      const item = mockDownloads.find((d) => d.id === args?.id);
+      if (item) item.proxy_name = args?.proxyName ?? "";
+      return;
+    }
     case "set_download_connections": {
       const item = mockDownloads.find((d) => d.id === args?.id);
       if (item) {
@@ -300,6 +305,8 @@ export class WebviewWindow {
   center = async () => {};
   setAlwaysOnTop = async () => {};
   setFocus = async () => {};
+  setTitle = async (_title: string) => {};
+  setSize = async (_size: unknown) => {};
   requestUserAttention = async () => {};
   // The real app closes its own OS window here. In the showcase that window is
   // a panel inside the demo frame, so hand the request to DemoWindow instead.

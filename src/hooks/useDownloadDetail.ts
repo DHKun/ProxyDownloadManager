@@ -123,6 +123,7 @@ export function useDownloadDetail(
     item,
     urlCopied,
     controls: detailControls(item?.status, pendingAction),
+    pendingAction,
     handleCopyUrl,
     handleOpenFile,
     handleOpenFolder,

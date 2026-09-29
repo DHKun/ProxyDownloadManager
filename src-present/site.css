@@ -37,7 +37,7 @@ body,
   background: #fff;
   overflow: hidden;
   width: 100%;
-  /* Tall enough for the 560px 新建下载 window the demo opens on top. */
+  /* Tall enough for the 640×560 新建下载 window plus its title bar. */
   height: min(86vh, 680px);
   min-height: 480px;
 }

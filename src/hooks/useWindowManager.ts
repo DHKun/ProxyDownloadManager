@@ -55,8 +55,8 @@ export function useWindowManager() {
     const base = window.location.origin + window.location.pathname.replace(/\/+$/, "");
     const win = new WebviewWindow("download-details", {
       url: `${base}?view=download-details&id=${id}`,
-      width: 460,
-      height: 520,
+      width: 560,
+      height: 320,
       title: t("properties.title"),
     });
     win.once("tauri://created", async () => {

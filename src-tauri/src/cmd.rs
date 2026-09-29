@@ -78,6 +78,15 @@ pub async fn set_download_connections(
 }
 
 #[tauri::command]
+pub fn set_download_proxy(
+    state: State<'_, Arc<AppState>>,
+    id: u64,
+    proxy_name: String,
+) -> Result<(), PdmError> {
+    state.dm.set_stored_proxy(id, proxy_name)
+}
+
+#[tauri::command]
 pub async fn set_download_rate_limit(
     state: State<'_, Arc<AppState>>,
     id: u64,

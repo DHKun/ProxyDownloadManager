@@ -36,6 +36,10 @@ type ExtraDialog =
 function DemoInner({ extra, setExtra }: { extra: ExtraDialog; setExtra: (d: ExtraDialog) => void }) {
   const { dialog, dialogActions } = useAppContext();
   const { settings } = useSettings();
+  const { data: downloads = [] } = useDownloads();
+  const detailTitle = extra?.type === "properties"
+    ? downloads.find((d) => d.id === extra.id)?.file_name
+    : undefined;
 
   useEffect(() => {
     if (settings) setLanguage(settings.language || "zh");
@@ -61,9 +65,9 @@ function DemoInner({ extra, setExtra }: { extra: ExtraDialog; setExtra: (d: Extr
       )}
       {extra?.type === "properties" && (
         <DemoWindow
-          title={t("properties.title")}
-          width={460}
-          height={520}
+          title={detailTitle || t("properties.title")}
+          width={560}
+          height={320}
           onClose={() => setExtra(null)}
         >
           <DetailsWindowHost id={extra.id} />
@@ -196,7 +200,7 @@ function Page() {
           <div className="mb-6 flex flex-wrap items-end justify-between gap-3">
             <div>
               <h2 className="site-display text-[22px] font-semibold">真实界面</h2>
-              <p className="mt-1 text-[14px] text-[#737373]">下面就是当前版本的主窗口。暂停、筛选、设置都可以点。</p>
+              <p className="mt-1 text-[14px] text-[#737373]">下面就是当前版本的主窗口。工具栏、筛选和详情都可以点。</p>
             </div>
             <p className="site-mono text-[12px] text-[#737373]">演示数据 · 不会真的下载</p>
           </div>
@@ -231,8 +235,8 @@ function Page() {
               </li>
               <li>
                 <span className="site-mono text-[12px] text-[#737373]">03</span>
-                <div className="font-medium">详情窗看每条连接。</div>
-                <div className="text-[#737373]">#1 #2 黑色进度条，暂停、限速、刷新过期链接都在这里。</div>
+                <div className="font-medium">详情窗一屏看完。</div>
+                <div className="text-[#737373]">横向小窗里是状态、速度、代理和一条连接进度，底部直接改代理、连接数和限速。</div>
               </li>
             </ol>
           </div>

@@ -1,8 +1,11 @@
 import { useEffect, type ReactNode } from "react";
 
+/** Fake title bar. Width/height props are the webview size, same as the desktop window. */
+const CHROME = 36;
+
 interface DemoWindowProps {
   title: string;
-  /** Real window size from useWindowManager; clamped to the demo frame. */
+  /** Webview size from useWindowManager. The title bar is added above it. */
   width: number;
   height: number;
   onClose: () => void;
@@ -11,7 +14,7 @@ interface DemoWindowProps {
 
 /**
  * A second OS window drawn inside the demo frame. The desktop app opens
- * 新建下载 / 详情 as separate 640x560 and 460x520 windows, so the showcase
+ * 新建下载 / 详情 as separate 640x560 and 560x320 windows, so the showcase
  * renders the same components behind the same chrome instead of inventing
  * a dialog the product never shows.
  */
@@ -33,7 +36,7 @@ export default function DemoWindow({ title, width, height, onClose, children }: 
     <div className="demo-window-layer" onMouseDown={onClose}>
       <div
         className="demo-window"
-        style={{ width: `min(${width}px, 100%)`, height: `min(${height}px, 100%)` }}
+        style={{ width: `min(${width}px, 100%)`, height: `min(${height + CHROME}px, 100%)` }}
         onMouseDown={(e) => e.stopPropagation()}
         role="dialog"
         aria-label={title}

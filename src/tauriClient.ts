@@ -51,6 +51,8 @@ export const tauriClient = {
   redownloadDownload: (id: number) => invoke<number>("redownload_download", { id }),
   setDownloadConnections: (id: number, connections: number) =>
     invoke<void>("set_download_connections", { id, connections }),
+  setDownloadProxy: (id: number, proxyName: string) =>
+    invoke<void>("set_download_proxy", { id, proxyName }),
   setDownloadRateLimit: (id: number, rateLimitBps: number) =>
     invoke<void>("set_download_rate_limit", { id, rateLimitBps }),
   setGlobalRateLimit: (rateLimitBps: number) =>

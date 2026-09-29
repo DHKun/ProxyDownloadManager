@@ -82,3 +82,54 @@ export function applyPartDownloaded(
     return { ...p, downloaded, status };
   });
 }
+
+export interface ConnectionSegment {
+  index: number;
+  /** 0–100 fill of this slice. */
+  percent: number;
+  /** Relative width. Real ranges use byte length; equal slices use 1. */
+  weight: number;
+  start: number;
+  end: number;
+  downloaded: number;
+}
+
+/**
+ * One slice per real range when parts exist, otherwise `connections` equal slices.
+ * Completed reads 100% even if the last part event was short.
+ */
+export function connectionSegments(
+  parts: DownloadPart[],
+  connections: number,
+  status: DownloadStatus,
+): ConnectionSegment[] {
+  const completed = status === "completed";
+  if (parts.length > 0) {
+    return parts.map((p) => {
+      const size = Math.max(0, p.end - p.start);
+      const percent = completed
+        ? 100
+        : size > 0
+          ? Math.min(100, Math.floor((Math.min(p.downloaded, size) / size) * 100))
+          : 0;
+      return {
+        index: p.index + 1,
+        percent,
+        weight: Math.max(1, size),
+        start: p.start,
+        end: p.end,
+        downloaded: completed && size > 0 ? size : p.downloaded,
+      };
+    });
+  }
+  const n = Math.max(0, connections);
+  if (n === 0) return [];
+  return Array.from({ length: n }, (_, i) => ({
+    index: i + 1,
+    percent: completed ? 100 : 0,
+    weight: 1,
+    start: 0,
+    end: 0,
+    downloaded: 0,
+  }));
+}
