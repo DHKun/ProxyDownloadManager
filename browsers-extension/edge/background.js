@@ -12,14 +12,21 @@ import {
   filterHeaders,
   mediaDedupKey,
   shouldSkipMediaUrl,
+  interceptDecision,
+  PROTOCOL_VERSION,
 } from "./protocol.js";
 import { t } from "./i18n.js";
 
+const DEBUG = false;
 const WS_URL = "ws://127.0.0.1:18999";
+const CLAIM_TIMEOUT_MS = 800;
+const ADD_TIMEOUT_MS = 3000;
+
 let ws = null;
 let reconnectTimer = null;
 let lastNotRunningNotificationAt = 0;
 let connected = false;
+const pendingRequests = new Map();
 
 const startedAt = Date.now();
 const STARTUP_GRACE_MS = 10000;
@@ -38,18 +45,28 @@ const defaultSettings = {
 
 const mediaByTab = new Map();
 const requestCtx = new Map();
+const bypassTabs = new Set();
+const passthroughUntil = new Map();
 
-async function isEnabled() {
-  const r = await chrome.storage.local.get(STORAGE_KEY);
-  return r[STORAGE_KEY] !== false;
+let runtimeEnabled = true;
+let runtimeSettings = { ...defaultSettings };
+let bypassNext = false;
+let activeTabId = null;
+
+function debug(...args) {
+  if (DEBUG) console.debug("[ProxyDM]", ...args);
 }
 
-async function getSettings() {
-  const r = await chrome.storage.local.get(SETTINGS_KEY);
-  return { ...defaultSettings, ...(r[SETTINGS_KEY] || {}) };
+function isEnabled() {
+  return runtimeEnabled;
+}
+
+function getSettings() {
+  return runtimeSettings;
 }
 
 async function setEnabled(enabled) {
+  runtimeEnabled = !!enabled;
   await chrome.storage.local.set({ [STORAGE_KEY]: enabled });
   updateIcon(enabled);
   broadcastStatus();
@@ -89,6 +106,7 @@ function updateIcon(enabled) {
 }
 
 function connect() {
+  if (!runtimeEnabled) return;
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
   let socket;
   try {
@@ -105,26 +123,33 @@ function connect() {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
     }
-    isEnabled().then(updateIcon);
+    updateIcon(runtimeEnabled);
     broadcastStatus();
+  };
+  socket.onmessage = (evt) => {
+    if (ws !== socket) return;
+    settleAck(evt.data);
   };
   socket.onclose = () => {
     if (ws !== socket) return;
     connected = false;
     ws = null;
-    isEnabled().then(updateIcon);
+    failPending();
+    updateIcon(runtimeEnabled);
     broadcastStatus();
     scheduleReconnect();
   };
   socket.onerror = () => {
     if (ws !== socket) return;
     connected = false;
+    failPending();
     ws = null;
     scheduleReconnect();
   };
 }
 
 function scheduleReconnect() {
+  if (!runtimeEnabled) return;
   if (reconnectTimer) return;
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
@@ -138,56 +163,64 @@ function disconnect() {
     reconnectTimer = null;
   }
   if (ws) {
-    ws.close();
+    const socket = ws;
     ws = null;
+    connected = false;
+    failPending();
+    try {
+      socket.close();
+    } catch {
+      /* already closing */
+    }
+  } else {
+    connected = false;
+    failPending();
   }
-  connected = false;
 }
 
-function sendReliable(payload) {
-  const body = typeof payload === "string" ? payload : JSON.stringify(payload);
-  const requestId = payload && payload.request_id;
+function failPending() {
+  const pending = [...pendingRequests.values()];
+  pendingRequests.clear();
+  for (const item of pending) item.finish(false);
+}
+
+function settleAck(data) {
+  const ack = parseAck(data);
+  if (ack.requestId && pendingRequests.has(ack.requestId)) {
+    const pending = pendingRequests.get(ack.requestId);
+    pendingRequests.delete(ack.requestId);
+    pending.finish(ack.accepted === true);
+    return;
+  }
+  // Older desktop builds omit request_id. Only accept that when a single
+  // request is in flight, so two downloads cannot take each other's ACK.
+  if (!ack.requestId && pendingRequests.size === 1) {
+    const [id, pending] = pendingRequests.entries().next().value;
+    pendingRequests.delete(id);
+    pending.finish(ack.accepted === true);
+  }
+}
+
+function sendReliable(payload, timeoutMs = ADD_TIMEOUT_MS) {
+  const requestId = (payload && payload.request_id) || crypto.randomUUID();
+  if (payload && typeof payload === "object") payload.request_id = requestId;
   return new Promise((resolve) => {
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer);
-      reconnectTimer = null;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      resolve(false);
+      return;
     }
-    let socket = null;
-    let done = false;
+    let finished = false;
     const finish = (ok) => {
-      if (done) return;
-      done = true;
+      if (finished) return;
+      finished = true;
       clearTimeout(timer);
-      if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
-        try {
-          socket.close();
-        } catch {
-          /* closing a one-shot socket */
-        }
-      }
+      pendingRequests.delete(requestId);
       resolve(ok);
     };
-    const timer = setTimeout(() => finish(false), 3000);
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    pendingRequests.set(requestId, { finish });
     try {
-      socket = new WebSocket(WS_URL);
-      socket.onopen = () => {
-        try {
-          socket.send(body);
-        } catch {
-          finish(false);
-        }
-      };
-      socket.onmessage = (evt) => {
-        const ack = parseAck(evt.data);
-        if (requestId && ack.requestId && ack.requestId !== requestId) return;
-        finish(ack.accepted === true);
-      };
-      socket.onclose = () => {
-        if (!done) finish(false);
-      };
-      socket.onerror = () => {
-        if (!done) finish(false);
-      };
+      ws.send(JSON.stringify(payload));
     } catch {
       finish(false);
     }
@@ -224,68 +257,158 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (!(await sendReliable(req))) notifyNotRunning();
 });
 
-chrome.downloads.onCreated.addListener(async (item) => {
-  if (!(await isEnabled())) return;
+chrome.downloads.onCreated.addListener((item) => {
   const downloadUrl = getDownloadUrl(item);
-  if (!downloadUrl || downloadUrl.startsWith("blob:")) return;
-  if (isRestoredDownloadEvent(item)) return;
-
-  const bypass = await consumeBypass(item);
-  if (bypass) return;
-
-  const settings = await getSettings();
-  if (shouldIgnore(downloadUrl, item, settings)) return;
-
-  const tab = await activeTab();
-  const req = await buildFromDownload(item, tab);
-  const ok = await sendReliable(req);
-  if (ok) {
-    chrome.downloads.cancel(item.id, () => {
-      chrome.downloads.erase({ id: item.id });
-    });
-  } else {
-    notifyNotRunning({ allowStartupGrace: true });
+  if (isPassthrough(downloadUrl) || isPassthrough(item.url) || isPassthrough(item.finalUrl)) {
+    debug("passthrough", item.id);
+    return;
   }
+  const once = bypassNext;
+  const held = activeTabId != null && bypassTabs.has(activeTabId);
+  const decision = interceptDecision({
+    enabled: runtimeEnabled,
+    connected: !!(connected && ws && ws.readyState === WebSocket.OPEN),
+    url: downloadUrl,
+    filename: item.filename || "",
+    fileSize: item.fileSize,
+    settings: runtimeSettings,
+    bypass: once || held,
+    restored: isRestoredDownloadEvent(item),
+  });
+  if (!decision.take) {
+    if (decision.reason === "bypass" && once) clearBypassNext();
+    debug("skip", item.id, decision.reason);
+    return;
+  }
+  void takeover(item, downloadUrl);
 });
 
-async function consumeBypass(item) {
-  const stored = await chrome.storage.session?.get?.(BYPASS_NEXT_KEY).catch(() => ({}));
-  if (stored && stored[BYPASS_NEXT_KEY]) {
-    await chrome.storage.session.set({ [BYPASS_NEXT_KEY]: false });
-    return true;
-  }
-  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-  const tab = tabs[0];
-  if (!tab?.id) return false;
-  try {
-    const resp = await chrome.tabs.sendMessage(tab.id, { action: "proxydm-bypass-state" });
-    if (resp && resp.bypass) return true;
-  } catch {
-    /* no content script on this page */
-  }
-  if (item.danger === "accepted") return false;
-  return false;
+function clearBypassNext() {
+  bypassNext = false;
+  chrome.storage.session?.set?.({ [BYPASS_NEXT_KEY]: false });
 }
 
-function shouldIgnore(url, item, settings) {
-  try {
-    const u = new URL(url);
-    const ignored = String(settings.ignoredDomains || "")
-      .split(/[,\s]+/)
-      .filter(Boolean);
-    if (ignored.some((d) => u.hostname === d || u.hostname.endsWith("." + d))) return true;
-    const ext = (item.filename || u.pathname).split(".").pop()?.toLowerCase() || "";
-    const ignoredExt = String(settings.ignoredExtensions || "")
-      .split(/[,\s]+/)
-      .filter(Boolean)
-      .map((s) => s.replace(/^\./, "").toLowerCase());
-    if (ext && ignoredExt.includes(ext)) return true;
-    const minSize = Number(settings.minSize || 0);
-    if (minSize > 0 && item.fileSize > 0 && item.fileSize < minSize) return true;
-  } catch {
-    return false;
+function allowPassthrough(url) {
+  if (!url) return;
+  passthroughUntil.set(url, Date.now() + 15000);
+}
+
+function isPassthrough(url) {
+  if (!url || !passthroughUntil.has(url)) return false;
+  const until = passthroughUntil.get(url);
+  passthroughUntil.delete(url);
+  return Date.now() <= until;
+}
+
+async function takeover(item, downloadUrl) {
+  const started = Date.now();
+  const requestId = crypto.randomUUID();
+  const filename = basename(item.filename) || filenameFromUrl(downloadUrl);
+  debug(`intercept #${item.id}`);
+  const claimed = await sendReliable(
+    {
+      protocol_version: PROTOCOL_VERSION,
+      request_id: requestId,
+      action: "claim",
+      url: downloadUrl,
+      filename,
+    },
+    CLAIM_TIMEOUT_MS,
+  );
+  if (!claimed) {
+    debug(`claim failed #${item.id}`);
+    notifyNotRunning({ allowStartupGrace: true });
+    return;
   }
-  return false;
+  debug(`claim accepted in ${Date.now() - started}ms`);
+
+  const state = await cancelDownload(item.id);
+  debug(`browser download cancelled in ${Date.now() - started}ms state=${state}`);
+  if (state === "complete") {
+    debug(`already complete #${item.id}; leaving the browser file`);
+    return;
+  }
+  if (state === "in_progress") {
+    debug(`cancel did not stop #${item.id}`);
+    return;
+  }
+
+  const tab = await activeTab();
+  const req = await buildFromDownload(item, tab, requestId);
+  let sent = await sendReliable(req);
+  if (!sent) sent = await sendReliable(req);
+  if (!sent) {
+    debug(`add failed, restoring browser download #${item.id}`);
+    restoreBrowserDownload(item, downloadUrl);
+    notifyNotRunning({ allowStartupGrace: true });
+    return;
+  }
+  debug(`full request sent in ${Date.now() - started}ms`);
+  chrome.downloads.erase({ id: item.id });
+}
+
+function downloadState(id) {
+  return new Promise((resolve) => {
+    try {
+      chrome.downloads.search({ id }, (items) => {
+        void chrome.runtime.lastError;
+        resolve((items && items[0] && items[0].state) || "interrupted");
+      });
+    } catch {
+      resolve("interrupted");
+    }
+  });
+}
+
+async function cancelDownload(id) {
+  await new Promise((resolve) => {
+    try {
+      chrome.downloads.cancel(id, () => {
+        void chrome.runtime.lastError;
+        resolve();
+      });
+    } catch {
+      resolve();
+    }
+  });
+  let state = await downloadState(id);
+  // Cancel is sometimes visible one tick later. One short re-read avoids
+  // treating a successful cancel as "still downloading".
+  if (state === "in_progress") {
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    state = await downloadState(id);
+  }
+  return state;
+}
+
+function restoreBrowserDownload(item, url) {
+  allowPassthrough(url);
+  allowPassthrough(item.url);
+  allowPassthrough(item.finalUrl);
+  const filename = basename(item.filename);
+  const start = (withName) => {
+    const options = { url, conflictAction: "uniquify", saveAs: false };
+    if (withName && filename) options.filename = filename;
+    try {
+      chrome.downloads.download(options, (downloadId) => {
+        const err = chrome.runtime.lastError;
+        if ((err || downloadId == null) && withName && filename) {
+          start(false);
+          return;
+        }
+        if (!err && downloadId != null) chrome.downloads.erase({ id: item.id });
+      });
+    } catch {
+      /* cancelled entry stays so the user can retry it */
+    }
+  };
+  start(true);
+}
+
+function basename(path) {
+  if (!path) return "";
+  const parts = String(path).split(/[/\\]/);
+  return parts[parts.length - 1] || "";
 }
 
 async function activeTab() {
@@ -309,10 +432,10 @@ async function buildFromTab(url, tab) {
   });
 }
 
-async function buildFromDownload(item, tab) {
+async function buildFromDownload(item, tab, requestId) {
   const url = getDownloadUrl(item);
   const cookies = await cookiesFor(url);
-  const ctx = requestCtx.get(url) || {};
+  const ctx = requestCtx.get(url) || requestCtx.get(item.url) || {};
   const headers = filterHeaders({
     ...(ctx.headers || {}),
     Cookie: cookies,
@@ -320,6 +443,8 @@ async function buildFromDownload(item, tab) {
     "User-Agent": navigator.userAgent,
   });
   return buildDownloadRequest({
+    requestId,
+    action: "add",
     url: item.url,
     finalUrl: item.finalUrl || item.url,
     filename: (item.filename || "").split(/[/\\]/).pop() || filenameFromUrl(url),
@@ -404,6 +529,24 @@ if (chrome.webRequest?.onHeadersReceived) {
 
 chrome.tabs?.onRemoved?.addListener((tabId) => {
   mediaByTab.delete(tabId);
+  bypassTabs.delete(tabId);
+  if (activeTabId === tabId) activeTabId = null;
+});
+
+chrome.tabs?.onActivated?.addListener((info) => {
+  activeTabId = info.tabId;
+});
+
+chrome.storage?.onChanged?.addListener((changes, area) => {
+  if (area === "local") {
+    if (changes[STORAGE_KEY]) runtimeEnabled = changes[STORAGE_KEY].newValue !== false;
+    if (changes[SETTINGS_KEY]) {
+      runtimeSettings = { ...defaultSettings, ...(changes[SETTINGS_KEY].newValue || {}) };
+    }
+  }
+  if (area === "session" && changes[BYPASS_NEXT_KEY]) {
+    bypassNext = !!changes[BYPASS_NEXT_KEY].newValue;
+  }
 });
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
@@ -415,9 +558,19 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     })();
     return true;
   }
+  if (request.action === "proxydm-bypass-change") {
+    const tabId = sender.tab?.id;
+    if (tabId != null) {
+      if (request.bypass) bypassTabs.add(tabId);
+      else bypassTabs.delete(tabId);
+    }
+    sendResponse({ ok: true });
+    return;
+  }
   if (request.action === "popup-status") {
     (async () => {
-      const enabled = await isEnabled();
+      await runtimeReady;
+      const enabled = isEnabled();
       const tab = await activeTab();
       let media = mediaByTab.get(tab?.id ?? -1) || [];
       if (media.length === 0) {
@@ -425,7 +578,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           if (list.length) { media = list; break; }
         }
       }
-      const settings = await getSettings();
+      const settings = getSettings();
       sendResponse({ enabled, connected, mediaCount: media.length, media, settings });
     })();
     return true;
@@ -435,13 +588,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
   if (request.action === "save-settings") {
+    runtimeSettings = { ...defaultSettings, ...(request.settings || {}) };
     chrome.storage.local.set({ [SETTINGS_KEY]: request.settings }).then(() => sendResponse({ ok: true }));
     return true;
   }
   if (request.action === "bypass-next") {
+    bypassNext = true;
     chrome.storage.session?.set?.({ [BYPASS_NEXT_KEY]: true });
     sendResponse({ ok: true });
-    return true;
+    return;
   }
   if (request.action === "download-media") {
     (async () => {
@@ -480,22 +635,43 @@ function broadcastStatus() {
   chrome.runtime.sendMessage({ action: "status-changed" }).catch(() => {});
 }
 
-chrome.runtime.onInstalled.addListener(async () => {
-  const on = await isEnabled();
-  updateIcon(on);
-  if (on) {
+async function loadRuntime() {
+  try {
+    const r = await chrome.storage.local.get([STORAGE_KEY, SETTINGS_KEY]);
+    runtimeEnabled = r[STORAGE_KEY] !== false;
+    runtimeSettings = { ...defaultSettings, ...(r[SETTINGS_KEY] || {}) };
+  } catch {
+    /* keep defaults until storage is readable */
+  }
+  try {
+    const stored = await chrome.storage.session?.get?.(BYPASS_NEXT_KEY);
+    bypassNext = !!(stored && stored[BYPASS_NEXT_KEY]);
+  } catch {
+    /* session storage is optional */
+  }
+  updateIcon(runtimeEnabled);
+  if (runtimeEnabled) {
     createContextMenus();
     connect();
+  } else {
+    disconnect();
   }
+  try {
+    const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    if (tabs[0]?.id != null) activeTabId = tabs[0].id;
+  } catch {
+    /* tabs permission missing */
+  }
+}
+
+const runtimeReady = loadRuntime();
+
+chrome.runtime.onInstalled.addListener(() => {
+  void loadRuntime();
 });
 
-chrome.runtime.onStartup.addListener(async () => {
-  const on = await isEnabled();
-  updateIcon(on);
-  if (on) {
-    createContextMenus();
-    connect();
-  }
+chrome.runtime.onStartup.addListener(() => {
+  void loadRuntime();
 });
 
 function notify(title, message) {
@@ -516,7 +692,7 @@ function notifyNotRunning({ allowStartupGrace = false } = {}) {
     notify(t("notifyOfflineTitle"), t("notifyOfflineBody"));
     lastNotRunningNotificationAt = now;
   }
-  isEnabled().then(updateIcon);
+  updateIcon(runtimeEnabled);
 }
 
 function getDownloadUrl(item) {

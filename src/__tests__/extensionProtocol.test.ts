@@ -5,6 +5,8 @@ import {
   buildDownloadRequest,
   shouldSkipMediaUrl,
   mediaDedupKey,
+  interceptDecision,
+  ignoreReason,
 } from "../../browsers-extension/shared/protocol.js";
 
 describe("extension protocol", () => {
@@ -58,6 +60,45 @@ describe("extension protocol", () => {
     expect(shouldSkipMediaUrl("data:video/mp4,xxx")).toBe(true);
     expect(shouldSkipMediaUrl("https://cdn.example/seg12.ts")).toBe(true);
     expect(shouldSkipMediaUrl("https://cdn.example/master.m3u8")).toBe(false);
+  });
+
+  const base = {
+    enabled: true,
+    connected: true,
+    url: "https://cdn.example/notes.txt",
+    filename: "notes.txt",
+    fileSize: 7000,
+    settings: { minSize: 0, ignoredDomains: "", ignoredExtensions: "ico,svg" },
+    bypass: false,
+    restored: false,
+  };
+
+  it("takes a small file when ProxyDM is connected", () => {
+    expect(interceptDecision(base)).toEqual({ take: true, reason: "take" });
+  });
+
+  it("leaves the browser download alone when ProxyDM is offline or disabled", () => {
+    expect(interceptDecision({ ...base, connected: false }).reason).toBe("offline");
+    expect(interceptDecision({ ...base, enabled: false }).reason).toBe("disabled");
+  });
+
+  it("skips blob, data, bypass, ignored extension, and ignored domain", () => {
+    expect(interceptDecision({ ...base, url: "blob:https://x/1" }).reason).toBe("blob");
+    expect(interceptDecision({ ...base, url: "data:text/plain,hi" }).reason).toBe("data");
+    expect(interceptDecision({ ...base, bypass: true }).reason).toBe("bypass");
+    expect(interceptDecision({ ...base, filename: "favicon.ico", url: "https://cdn.example/favicon.ico" }).reason).toBe("ignored-extension");
+    expect(interceptDecision({
+      ...base,
+      url: "https://skip.example/a.txt",
+      settings: { ...base.settings, ignoredDomains: "skip.example" },
+    }).reason).toBe("ignored-domain");
+  });
+
+  it("applies min size only when the browser already knows a smaller size", () => {
+    const settings = { ...base.settings, minSize: 1024 };
+    expect(ignoreReason(base.url, "notes.txt", 100, settings)).toBe("min-size");
+    expect(ignoreReason(base.url, "notes.txt", -1, settings)).toBe("");
+    expect(interceptDecision({ ...base, fileSize: 7000, settings }).reason).toBe("take");
   });
 
   it("dedupes by origin+path", () => {

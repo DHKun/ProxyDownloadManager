@@ -1,7 +1,9 @@
 let bypass = false;
 
 function setBypass(on) {
+  if (bypass === on) return;
   bypass = on;
+  chrome.runtime.sendMessage({ action: "proxydm-bypass-change", bypass: on }).catch(() => {});
 }
 
 window.addEventListener(

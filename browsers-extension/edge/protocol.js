@@ -124,3 +124,58 @@ export function shouldSkipMediaUrl(url) {
   if (/\.ts(\?|$)/.test(lower) && !lower.includes(".m3u8")) return true;
   return false;
 }
+
+function extensionOf(filename, url) {
+  let path = filename || "";
+  if (!path) {
+    try {
+      path = new URL(url).pathname;
+    } catch {
+      path = url || "";
+    }
+  }
+  const ext = path.split(".").pop()?.toLowerCase() || "";
+  if (!ext || /[\\/]/.test(ext)) return "";
+  return ext;
+}
+
+// Why a browser download must be left alone. Empty string means it can be taken.
+export function ignoreReason(url, filename, fileSize, settings) {
+  const cfg = settings || {};
+  let hostname = "";
+  try {
+    hostname = new URL(url).hostname;
+  } catch {
+    return "";
+  }
+  const ignored = String(cfg.ignoredDomains || "")
+    .split(/[,\s]+/)
+    .filter(Boolean);
+  if (ignored.some((d) => hostname === d || hostname.endsWith("." + d))) return "ignored-domain";
+  const ext = extensionOf(filename, url);
+  const ignoredExt = String(cfg.ignoredExtensions || "")
+    .split(/[,\s]+/)
+    .filter(Boolean)
+    .map((s) => s.replace(/^\./, "").toLowerCase());
+  if (ext && ignoredExt.includes(ext)) return "ignored-extension";
+  const minSize = Number(cfg.minSize || 0);
+  const size = Number(fileSize || 0);
+  if (minSize > 0 && size > 0 && size < minSize) return "min-size";
+  return "";
+}
+
+// Fast-path decision. Reads only the values the caller already has in memory.
+export function interceptDecision(input) {
+  const src = input || {};
+  if (!src.enabled) return { take: false, reason: "disabled" };
+  if (!src.connected) return { take: false, reason: "offline" };
+  const url = src.url || "";
+  if (!url) return { take: false, reason: "empty-url" };
+  if (url.startsWith("blob:")) return { take: false, reason: "blob" };
+  if (url.startsWith("data:")) return { take: false, reason: "data" };
+  if (src.restored) return { take: false, reason: "restored" };
+  if (src.bypass) return { take: false, reason: "bypass" };
+  const ignored = ignoreReason(url, src.filename || "", src.fileSize, src.settings);
+  if (ignored) return { take: false, reason: ignored };
+  return { take: true, reason: "take" };
+}
