@@ -1,8 +1,11 @@
 pub mod chunk;
 pub mod concurrent;
+
 pub mod file_io;
 pub mod hls;
 pub mod part_progress;
+#[cfg(test)]
+mod range_http;
 pub mod single;
 pub mod task_download;
 
@@ -262,11 +265,61 @@ mod tests {
         }
     }
 
-    /// Spawn a mock HTTP server that supports Range requests.
-    /// Returns the base URL (http://127.0.0.1:PORT).
+    fn header_lines<'a>(req: &'a str, name: &str) -> Vec<&'a str> {
+        let prefix = format!("{name}:");
+        req.lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.len() >= prefix.len() && line[..prefix.len()].eq_ignore_ascii_case(&prefix)
+                {
+                    Some(line[prefix.len()..].trim())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Inclusive byte range from the first Range header, if any.
+    fn first_range(req: &str) -> Option<(u64, Option<u64>)> {
+        let raw = header_lines(req, "range").into_iter().next()?;
+        let spec = raw.split(',').next()?.trim();
+        let spec = spec
+            .strip_prefix("bytes=")
+            .or_else(|| spec.strip_prefix("bytes ="))?;
+        let spec = spec.trim();
+        let (start, end) = spec.split_once('-')?;
+        let start = start.trim().parse().ok()?;
+        let end = if end.trim().is_empty() {
+            None
+        } else {
+            Some(end.trim().parse().ok()?)
+        };
+        Some((start, end))
+    }
+
+    async fn read_http_headers(stream: &mut tokio::net::TcpStream) -> Option<String> {
+        let mut total = Vec::new();
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            if n == 0 {
+                return None;
+            }
+            total.extend_from_slice(&buf[..n]);
+            if total.windows(4).any(|w| w == b"\r\n\r\n") || total.len() > 64 * 1024 {
+                break;
+            }
+        }
+        Some(String::from_utf8_lossy(&total).into_owned())
+    }
+
+    /// HTTP/1.1 server. When `supports_range` is set, a Range request gets 206
+    /// with that exact slice. Otherwise every request is a full 200.
     async fn spawn_mock_server(file_data: Vec<u8>, supports_range: bool) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let file_len = file_data.len() as u64;
 
         tokio::spawn(async move {
             loop {
@@ -274,97 +327,42 @@ mod tests {
                     Ok(conn) => conn,
                     Err(_) => return,
                 };
-
-                // Read request headers
-                let mut buf = vec![0u8; 4096];
-                let mut total = Vec::new();
-                loop {
-                    let n = stream.read(&mut buf).await.unwrap_or(0);
-                    if n == 0 {
-                        break;
+                let file_data = file_data.clone();
+                tokio::spawn(async move {
+                    let Some(req) = read_http_headers(&mut stream).await else {
+                        return;
+                    };
+                    if supports_range {
+                        if let Some((start, end)) = first_range(&req) {
+                            if file_len == 0 || start >= file_len {
+                                let _ = stream
+                                    .write_all(
+                                        b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                    )
+                                    .await;
+                                return;
+                            }
+                            let end = end.unwrap_or(file_len - 1).min(file_len - 1);
+                            if end < start {
+                                return;
+                            }
+                            let body = &file_data[start as usize..=end as usize];
+                            let hdr = format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{file_len}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(hdr.as_bytes()).await;
+                            let _ = stream.write_all(body).await;
+                            return;
+                        }
                     }
-                    total.extend_from_slice(&buf[..n]);
-                    if total.windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                let req = String::from_utf8_lossy(&total);
-                let has_range = req.contains("Range: bytes=");
-
-                if !supports_range || req.contains("bytes=0-0") {
-                    // Probe request: respond with 206 + Content-Range
-                    let body = if supports_range && req.contains("bytes=0-0") {
-                        b"X".to_vec() // 1 byte for probe
-                    } else {
-                        file_data.clone()
-                    };
-                    let content_len = body.len();
-                    let status_line = if supports_range && (req.contains("bytes=0-0") || has_range)
-                    {
-                        let range = if req.contains("bytes=0-0") {
-                            (0u64, 0u64)
-                        } else {
-                            // Parse the Range header
-                            let start = req
-                                .lines()
-                                .find(|l| l.starts_with("Range:"))
-                                .and_then(|l| l.split("bytes=").nth(1))
-                                .and_then(|r| r.split('-').next())
-                                .and_then(|s| s.trim().parse::<u64>().ok())
-                                .unwrap_or(0);
-                            let end = req
-                                .lines()
-                                .find(|l| l.starts_with("Range:"))
-                                .and_then(|l| l.split("bytes=").nth(1))
-                                .and_then(|r| r.split('-').nth(1))
-                                .and_then(|s| s.trim().parse::<u64>().ok())
-                                .unwrap_or(content_len as u64 - 1);
-                            (start, end)
-                        };
-                        format!(
-                            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\n\r\n",
-                            range.0, range.1, file_data.len(),
-                            range.1 - range.0 + 1
-                        )
-                    } else {
-                        format!(
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Disposition: attachment; filename=test.bin\r\n\r\n",
-                            content_len
-                        )
-                    };
-                    let _ = stream.write_all(status_line.as_bytes()).await;
-                    let response_body = if supports_range && !req.contains("bytes=0-0") && has_range
-                    {
-                        // Parse range and send the requested bytes
-                        let start = req
-                            .lines()
-                            .find(|l| l.starts_with("Range:"))
-                            .and_then(|l| l.split("bytes=").nth(1))
-                            .and_then(|r| r.split('-').next())
-                            .and_then(|s| s.trim().parse::<u64>().ok())
-                            .unwrap_or(0);
-                        let end = req
-                            .lines()
-                            .find(|l| l.starts_with("Range:"))
-                            .and_then(|l| l.split("bytes=").nth(1))
-                            .and_then(|r| r.split('-').nth(1))
-                            .and_then(|s| s.trim().parse::<u64>().ok())
-                            .unwrap_or(file_data.len() as u64 - 1);
-                        file_data[start as usize..=end as usize].to_vec()
-                    } else if supports_range && req.contains("bytes=0-0") {
-                        vec![b'X']
-                    } else {
-                        body
-                    };
-                    let _ = stream.write_all(&response_body).await;
-                } else {
-                    // Regular GET — return full file
-                    let body = file_data.clone();
-                    let status_line =
-                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
-                    let _ = stream.write_all(status_line.as_bytes()).await;
-                    let _ = stream.write_all(&body).await;
-                }
+                    let hdr = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Disposition: attachment; filename=test.bin\r\nConnection: close\r\n\r\n",
+                        file_data.len()
+                    );
+                    let _ = stream.write_all(hdr.as_bytes()).await;
+                    let _ = stream.write_all(&file_data).await;
+                });
             }
         });
 

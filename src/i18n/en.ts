@@ -109,6 +109,9 @@ const en = {
     close: "Close",
     retry: "Retry",
     conn: "Conn.",
+    switchingProxy: "Switching proxy…",
+    connectionsLocked: "This download mode cannot change the connection count while it is running",
+    controlFailed: "That change did not apply",
   },
   settings: {
     title: "Settings",

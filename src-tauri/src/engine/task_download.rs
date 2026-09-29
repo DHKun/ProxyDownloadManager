@@ -1,6 +1,6 @@
 use crate::engine::file_io::write_at;
 use crate::engine::part_progress::PartProgressTracker;
-use crate::headers::apply_headers;
+use crate::headers::prepare_request;
 use crate::network::limiter::MultiLimiter;
 use crate::retry::{is_fatal_client_status, is_retryable_status};
 use crate::types::Task;
@@ -81,6 +81,68 @@ pub fn validate_content_range(
     true
 }
 
+/// Why waiting for response headers failed. The body is not covered:
+/// reqwest's request timeout would abort a multi-gigabyte transfer.
+#[derive(Debug)]
+pub enum HeaderWait {
+    Cancelled,
+    Failed(String),
+}
+
+impl std::fmt::Display for HeaderWait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => f.write_str("cancelled"),
+            Self::Failed(msg) => f.write_str(msg),
+        }
+    }
+}
+
+/// Send a request and wait only for the response headers.
+/// `cancel` is polled while the headers are outstanding so pause does not
+/// sit behind a 30s header timeout.
+pub async fn send_headers(
+    req: reqwest::RequestBuilder,
+    cancel: Option<&AtomicBool>,
+) -> Result<reqwest::Response, HeaderWait> {
+    let fut = req.send();
+    tokio::pin!(fut);
+    let timeout = tokio::time::sleep(std::time::Duration::from_secs(30));
+    tokio::pin!(timeout);
+    tokio::select! {
+        biased;
+        _ = until_cancelled(cancel) => Err(HeaderWait::Cancelled),
+        result = &mut fut => match result {
+            Ok(resp) => Ok(resp),
+            Err(e) => {
+                let mut msg = e.to_string();
+                let mut src = std::error::Error::source(&e);
+                while let Some(s) = src {
+                    msg.push_str(&format!(": {s}"));
+                    src = s.source();
+                }
+                Err(HeaderWait::Failed(msg))
+            }
+        },
+        _ = &mut timeout => Err(HeaderWait::Failed(
+            "timed out waiting for response headers".into(),
+        )),
+    }
+}
+
+async fn until_cancelled(cancel: Option<&AtomicBool>) {
+    let Some(flag) = cancel else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if flag.load(Ordering::Relaxed) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 pub async fn download_task(
     url: &str,
     client: &reqwest::Client,
@@ -101,22 +163,20 @@ pub async fn download_task(
         format!("{}", task.offset + task.length - 1)
     };
     let range_header = format!("bytes={}-{}", task.offset, range_end);
-    let mut req = client.get(url).header("Range", &range_header);
-    req = apply_headers(req, headers, user_agent);
+    let req = prepare_request(client.get(url), headers, user_agent, Some(&range_header));
     log::debug!(
-        "[ProxyDM] concurrent_task offset={} range_end={}",
+        "[ProxyDM] concurrent_task offset={} range={}",
         task.offset,
-        range_end
+        range_header
     );
-    let resp = match req.send().await {
+    let resp = match send_headers(req, Some(cancel)).await {
         Ok(r) => r,
-        Err(e) => {
-            let mut msg = format!("Request failed: {}", e);
-            let mut src = std::error::Error::source(&e);
-            while let Some(s) = src {
-                msg.push_str(&format!(": {}", s));
-                src = s.source();
-            }
+        Err(HeaderWait::Cancelled) => {
+            return TaskResult::Partial {
+                remaining: task.clone(),
+            };
+        }
+        Err(HeaderWait::Failed(msg)) => {
             log::error!(
                 "[ProxyDM] concurrent_task REQUEST ERROR offset={}: {}",
                 task.offset,
@@ -136,11 +196,26 @@ pub async fn download_task(
     }
 
     let status = resp.status();
-    log::debug!(
-        "[ProxyDM] concurrent_task offset={} HTTP {}",
-        task.offset,
-        status
-    );
+    if status != reqwest::StatusCode::OK && status != reqwest::StatusCode::PARTIAL_CONTENT {
+        log::info!(
+            "[ProxyDM] concurrent_task offset={} HTTP {} range={}",
+            task.offset,
+            status,
+            range_header
+        );
+    } else if task.offset == 0 {
+        log::info!(
+            "[ProxyDM] concurrent_task offset=0 HTTP {} range={}",
+            status,
+            range_header
+        );
+    } else {
+        log::debug!(
+            "[ProxyDM] concurrent_task offset={} HTTP {}",
+            task.offset,
+            status
+        );
+    }
 
     // 200 on a Range request means the server ignored the range. The first
     // chunk may still be a full-object 200 whose Content-Length matches the
@@ -256,12 +331,24 @@ pub async fn download_task(
             return TaskResult::Cancelled;
         }
 
-        // Abort slow chunks so other workers can steal remaining work
+        // Abort slow chunks so other workers can steal remaining work.
+        // Flush first: bytes sitting in `buf` are real progress and must not
+        // be dropped when the remainder is re-queued.
         let elapsed = start_time.elapsed();
+        let pending = written + buf.len() as u64;
         if elapsed > std::time::Duration::from_secs(30)
             && chunk_size > 0
-            && written < chunk_size / 10
+            && pending < chunk_size / 10
         {
+            if !buf.is_empty() {
+                if let Err(e) = write_at(file, &buf, base_offset + written) {
+                    return TaskResult::Fatal(format!("write_at error: {}", e));
+                }
+                let n = buf.len() as u64;
+                note_write(bytes_written, parts.as_deref(), base_offset + written, n);
+                written += n;
+                buf.clear();
+            }
             log::debug!(
                 "[ProxyDM] slow chunk offset={} written={}/{} after {}s, re-queuing",
                 base_offset,
@@ -270,6 +357,9 @@ pub async fn download_task(
                 elapsed.as_secs()
             );
             let remaining = chunk_size.saturating_sub(written);
+            if remaining == 0 {
+                return TaskResult::Complete;
+            }
             return TaskResult::Partial {
                 remaining: Task {
                     offset: base_offset + written,
@@ -283,8 +373,20 @@ pub async fn download_task(
         let chunk = match chunk_result {
             Ok(Some(Ok(c))) => c,
             Ok(Some(Err(e))) => {
+                if !buf.is_empty() {
+                    if let Err(err) = write_at(file, &buf, base_offset + written) {
+                        return TaskResult::Fatal(format!("write_at error: {}", err));
+                    }
+                    let n = buf.len() as u64;
+                    note_write(bytes_written, parts.as_deref(), base_offset + written, n);
+                    written += n;
+                    buf.clear();
+                }
                 let remaining = chunk_size.saturating_sub(written);
-                if remaining > 0 && written > 0 {
+                if remaining == 0 {
+                    return TaskResult::Complete;
+                }
+                if written > 0 {
                     return TaskResult::Partial {
                         remaining: Task {
                             offset: base_offset + written,

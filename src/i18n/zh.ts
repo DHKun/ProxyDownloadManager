@@ -111,6 +111,9 @@ const zh: Translations = {
     close: "关闭",
     retry: "重试",
     conn: "连接",
+    switchingProxy: "切换代理…",
+    connectionsLocked: "当前下载模式不支持运行时修改连接数",
+    controlFailed: "修改没有生效",
   },
   settings: {
     title: "设置",

@@ -1,4 +1,3 @@
-use crate::headers::apply_headers;
 use crate::network::limiter::MultiLimiter;
 use crate::network::pool::NetworkPool;
 use crate::types::{EngineConfig, Event, EventKind, HlsVariantInfo, PdmError, PdmResult};
@@ -119,8 +118,10 @@ pub async fn fetch_text(
     user_agent: &str,
 ) -> PdmResult<String> {
     let client = pool.get_client(proxy)?;
-    let req = apply_headers(client.get(url), headers, user_agent);
-    let resp = req.send().await.map_err(PdmError::from)?;
+    let req = crate::headers::prepare_request(client.get(url), headers, user_agent, None);
+    let resp = crate::engine::task_download::send_headers(req, None)
+        .await
+        .map_err(|e| PdmError::Network(e.to_string()))?;
     if !resp.status().is_success() {
         return Err(PdmError::Http(resp.status().as_u16()));
     }
@@ -240,8 +241,17 @@ impl HlsDownloader {
                     if cancel.load(Ordering::Relaxed) {
                         return Err("cancelled".to_string());
                     }
-                    let req = apply_headers(client.get(&uri), &headers, &ua);
-                    let resp = req.send().await.map_err(|e| e.to_string())?;
+                    let req =
+                        crate::headers::prepare_request(client.get(&uri), &headers, &ua, None);
+                    let resp = match crate::engine::task_download::send_headers(req, Some(&cancel))
+                        .await
+                    {
+                        Ok(resp) => resp,
+                        Err(crate::engine::task_download::HeaderWait::Cancelled) => {
+                            return Err("cancelled".to_string());
+                        }
+                        Err(e) => return Err(e.to_string()),
+                    };
                     if !resp.status().is_success() {
                         return Err(format!("HTTP {}", resp.status().as_u16()));
                     }

@@ -23,6 +23,15 @@ struct PendingDownload {
     hooks: EngineHooks,
 }
 
+/// Fields a queued download can still change before it starts.
+#[derive(Default)]
+pub struct PendingPatch {
+    pub proxy_url: Option<String>,
+    pub proxy_name: Option<String>,
+    pub connections: Option<u32>,
+    pub rate_limit_bps: Option<u64>,
+}
+
 struct ActiveDownload {
     cancel: Arc<AtomicBool>,
     handle: tokio::task::JoinHandle<()>,
@@ -324,6 +333,29 @@ impl WorkerPool {
             false
         }
     }
+
+    /// Update a download that has not started. Returns false when it is no
+    /// longer waiting, so the caller can avoid showing a value the worker
+    /// will not use.
+    pub async fn configure_pending(&self, id: u64, patch: PendingPatch) -> bool {
+        let mut pending = self.pending.lock().await;
+        let Some(entry) = pending.iter_mut().find(|p| p.id == id) else {
+            return false;
+        };
+        if let Some(url) = patch.proxy_url {
+            entry.cfg.proxy_url = url;
+        }
+        if let Some(name) = patch.proxy_name {
+            entry.cfg.proxy_name = name;
+        }
+        if let Some(connections) = patch.connections {
+            entry.cfg.connections = connections;
+        }
+        if let Some(rate) = patch.rate_limit_bps {
+            entry.cfg.rate_limit_bps = rate;
+        }
+        true
+    }
 }
 
 #[cfg(test)]
@@ -444,6 +476,90 @@ mod tests {
         // After cancel_and_wait, the task should be removed from active map
         let active = pool.active.lock().await;
         assert!(!active.contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn configure_pending_updates_queued_config_only() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let pool = WorkerPool::new(0, tx, false, 1, 0);
+        let id = pool.next_id();
+        let admission = pool.add_with_id(test_config(), id, hooks()).await.unwrap();
+        assert_eq!(admission, Admission::Queued);
+        assert!(
+            pool.configure_pending(
+                id,
+                PendingPatch {
+                    proxy_url: Some("http://127.0.0.1:9".into()),
+                    proxy_name: Some("clash".into()),
+                    connections: Some(8),
+                    rate_limit_bps: Some(1024),
+                },
+            )
+            .await
+        );
+        let pending = pool.pending.lock().await;
+        let cfg = &pending[0].cfg;
+        assert_eq!(cfg.proxy_url, "http://127.0.0.1:9");
+        assert_eq!(cfg.proxy_name, "clash");
+        assert_eq!(cfg.connections, 8);
+        assert_eq!(cfg.rate_limit_bps, 1024);
+        drop(pending);
+        assert!(!pool.configure_pending(999, PendingPatch::default()).await);
+    }
+
+    #[tokio::test]
+    async fn live_connection_and_rate_updates_hit_the_running_worker() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    drop(stream);
+                });
+            }
+        });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let pool = WorkerPool::new(2, tx, false, 1, 0);
+        let mut cfg = test_config();
+        cfg.url = format!("http://127.0.0.1:{}/file.bin", addr.port());
+        cfg.supports_range = true;
+        cfg.total_size = 1024 * 1024;
+        cfg.part_ranges = vec![(0, cfg.total_size)];
+        cfg.connections = 4;
+        let id = pool.next_id();
+        let admission = pool.add_with_id(cfg, id, hooks()).await.unwrap();
+        assert_eq!(admission, Admission::Started);
+        assert!(pool.set_connections(id, 16).await);
+        {
+            let active = pool.active.lock().await;
+            assert_eq!(
+                active
+                    .get(&id)
+                    .unwrap()
+                    .desired_connections
+                    .load(Ordering::Relaxed),
+                16
+            );
+        }
+        assert!(pool.set_connections(id, 4).await);
+        assert!(pool.set_download_rate_limit(id, 1_048_576).await);
+        {
+            let active = pool.active.lock().await;
+            let entry = active.get(&id).unwrap();
+            assert_eq!(entry.desired_connections.load(Ordering::Relaxed), 4);
+            assert_eq!(entry.limiter.per_download.bps(), 1_048_576);
+        }
+        assert!(pool.set_download_rate_limit(id, 0).await);
+        {
+            let active = pool.active.lock().await;
+            assert_eq!(active.get(&id).unwrap().limiter.per_download.bps(), 0);
+        }
+        pool.cancel_and_wait(id).await;
+        assert!(!pool.active.lock().await.contains_key(&id));
     }
 
     #[tokio::test]

@@ -2,6 +2,8 @@ use crate::types::PendingDownloadRequest;
 use std::collections::HashMap;
 
 /// Headers that are safe and useful to replay on a download request.
+/// Range and If-Range are not replayed: the engine owns those so a stored
+/// browser value cannot be appended beside the chunk's Range.
 const ALLOWED: &[&str] = &[
     "cookie",
     "referer",
@@ -11,8 +13,6 @@ const ALLOWED: &[&str] = &[
     "accept",
     "accept-language",
     "accept-encoding",
-    "range",
-    "if-range",
     "if-match",
     "if-none-match",
     "if-modified-since",
@@ -105,6 +105,14 @@ pub fn apply_headers(
 ) -> reqwest::RequestBuilder {
     let mut has_ua = false;
     for (k, v) in headers {
+        // Old rows may still store these. reqwest appends headers, so they
+        // have to be dropped here — setting Range afterwards would not replace them.
+        if k.eq_ignore_ascii_case("range")
+            || k.eq_ignore_ascii_case("if-range")
+            || k.eq_ignore_ascii_case("accept-encoding")
+        {
+            continue;
+        }
         if k.eq_ignore_ascii_case("user-agent") {
             has_ua = true;
         }
@@ -112,6 +120,25 @@ pub fn apply_headers(
     }
     if !has_ua && !user_agent.is_empty() {
         req = req.header("User-Agent", user_agent);
+    }
+    req
+}
+
+/// Replay caller headers, then pin the fields the engine owns.
+/// `range` is set last so the request carries exactly one Range.
+/// Accept-Encoding is always `identity`: a gzip body does not match byte ranges.
+pub fn prepare_request(
+    req: reqwest::RequestBuilder,
+    headers: &HashMap<String, String>,
+    user_agent: &str,
+    range: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let mut req = apply_headers(req, headers, user_agent);
+    req = req.header("Accept-Encoding", "identity");
+    if let Some(range) = range {
+        if !range.is_empty() {
+            req = req.header("Range", range);
+        }
     }
     req
 }
@@ -205,10 +232,14 @@ mod tests {
         input.insert("Cookie".into(), "sid=1".into());
         input.insert("Referer".into(), "https://example.com/".into());
         input.insert("Content-Length".into(), "12".into());
+        input.insert("Range".into(), "bytes=0-0".into());
+        input.insert("If-Range".into(), "\"etag\"".into());
         let out = filter_headers(&input);
         assert_eq!(out.get("Cookie").unwrap(), "sid=1");
         assert_eq!(out.get("Referer").unwrap(), "https://example.com/");
         assert!(!out.keys().any(|k| k.eq_ignore_ascii_case("host")));
+        assert!(!out.keys().any(|k| k.eq_ignore_ascii_case("range")));
+        assert!(!out.keys().any(|k| k.eq_ignore_ascii_case("if-range")));
         assert!(!out
             .keys()
             .any(|k| k.to_ascii_lowercase().starts_with("sec-")));
@@ -228,6 +259,40 @@ mod tests {
         assert_eq!(h.get("Cookie").unwrap(), "a=b");
         assert_eq!(h.get("Referer").unwrap(), "https://ref.example/");
         assert_eq!(h.get("User-Agent").unwrap(), "UA/1");
+    }
+
+    #[test]
+    fn prepare_request_sends_one_engine_range_and_identity() {
+        let client = reqwest::Client::new();
+        let mut headers = HashMap::new();
+        headers.insert("Range".into(), "bytes=0-0".into());
+        headers.insert("If-Range".into(), "\"abc\"".into());
+        headers.insert("Accept-Encoding".into(), "gzip".into());
+        headers.insert("Cookie".into(), "a=b".into());
+        let req = prepare_request(
+            client.get("http://127.0.0.1/file"),
+            &headers,
+            "ProxyDM",
+            Some("bytes=10-19"),
+        )
+        .build()
+        .unwrap();
+        let ranges: Vec<_> = req
+            .headers()
+            .get_all("range")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ranges, vec!["bytes=10-19".to_string()]);
+        let encodings: Vec<_> = req
+            .headers()
+            .get_all("accept-encoding")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(encodings, vec!["identity".to_string()]);
+        assert!(req.headers().get("if-range").is_none());
+        assert_eq!(req.headers().get("cookie").unwrap(), "a=b");
     }
 
     #[test]

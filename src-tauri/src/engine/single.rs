@@ -42,14 +42,19 @@ impl SingleDownloader {
             })
             .map_err(|e| PdmError::ClientBuild(e.to_string()))?
             .get(&cfg.url);
-        if resume_from > 0 {
-            req = req.header("Range", format!("bytes={resume_from}-"));
-        }
-        req = crate::headers::apply_headers(req, &cfg.headers, &cfg.user_agent);
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| PdmError::Network(e.to_string()))?;
+        let range = if resume_from > 0 {
+            Some(format!("bytes={resume_from}-"))
+        } else {
+            None
+        };
+        req = crate::headers::prepare_request(req, &cfg.headers, &cfg.user_agent, range.as_deref());
+        let resp = match crate::engine::task_download::send_headers(req, Some(&cancel)).await {
+            Ok(resp) => resp,
+            Err(crate::engine::task_download::HeaderWait::Cancelled) => {
+                return Err(PdmError::Cancelled);
+            }
+            Err(e) => return Err(PdmError::Network(e.to_string())),
+        };
         log::info!("[ProxyDM] single id={} HTTP {}", cfg.id, resp.status());
 
         if cancel.load(Ordering::Relaxed) {

@@ -26,6 +26,7 @@ let ws = null;
 let reconnectTimer = null;
 let lastNotRunningNotificationAt = 0;
 let connected = false;
+let downloaderVersion = "";
 const pendingRequests = new Map();
 
 const startedAt = Date.now();
@@ -128,11 +129,23 @@ function connect() {
   };
   socket.onmessage = (evt) => {
     if (ws !== socket) return;
+    let parsed = null;
+    try {
+      parsed = JSON.parse(evt.data);
+    } catch {
+      parsed = null;
+    }
+    if (parsed && parsed.type === "hello") {
+      downloaderVersion = String(parsed.version || "");
+      broadcastStatus();
+      return;
+    }
     settleAck(evt.data);
   };
   socket.onclose = () => {
     if (ws !== socket) return;
     connected = false;
+    downloaderVersion = "";
     ws = null;
     failPending();
     updateIcon(runtimeEnabled);
@@ -142,6 +155,7 @@ function connect() {
   socket.onerror = () => {
     if (ws !== socket) return;
     connected = false;
+    downloaderVersion = "";
     failPending();
     ws = null;
     scheduleReconnect();
@@ -166,6 +180,7 @@ function disconnect() {
     const socket = ws;
     ws = null;
     connected = false;
+    downloaderVersion = "";
     failPending();
     try {
       socket.close();
@@ -174,6 +189,7 @@ function disconnect() {
     }
   } else {
     connected = false;
+    downloaderVersion = "";
     failPending();
   }
 }
@@ -579,7 +595,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         }
       }
       const settings = getSettings();
-      sendResponse({ enabled, connected, mediaCount: media.length, media, settings });
+      sendResponse({
+        enabled,
+        connected,
+        downloaderVersion,
+        mediaCount: media.length,
+        media,
+        settings,
+      });
     })();
     return true;
   }

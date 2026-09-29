@@ -27,6 +27,9 @@ const en = {
   actionConnected: "ProxyDM connected",
   actionOffline: "ProxyDM enabled — desktop offline",
   actionDisabled: "ProxyDM disabled",
+  extVersion: "Extension",
+  dlVersion: "Downloader",
+  dlOffline: "Downloader not connected",
 };
 
 const zh = {
@@ -58,6 +61,9 @@ const zh = {
   actionConnected: "ProxyDM 已连接",
   actionOffline: "ProxyDM 已开启 — 桌面端离线",
   actionDisabled: "ProxyDM 已关闭",
+  extVersion: "扩展",
+  dlVersion: "下载器",
+  dlOffline: "下载器未连接",
 };
 
 function uiLang() {

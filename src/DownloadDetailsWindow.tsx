@@ -13,6 +13,11 @@ import { Select } from "./components/ui/select";
 import { tauriClient } from "./tauriClient";
 import FileIcon from "./components/FileIcon";
 import type { DownloadItem } from "./types";
+import {
+  connectionOptionLabel,
+  proxySelectLabel,
+  runtimeControlCapabilities,
+} from "./utils/runtimeControls";
 
 const CONN_OPTIONS = [0, 1, 4, 8, 16, 32, 64];
 const RATE_OPTIONS = [0, 256 * 1024, 1024 * 1024, 5 * 1024 * 1024, 10 * 1024 * 1024];
@@ -81,6 +86,8 @@ export default function DownloadDetailsWindow() {
   const [, bumpLang] = useState(0);
   const [draft, setDraft] = useState<Draft | null>(null);
   const [extraBusy, setExtraBusy] = useState(false);
+  const [controlBusy, setControlBusy] = useState<"proxy" | "conn" | "rate" | null>(null);
+  const [controlError, setControlError] = useState<string | null>(null);
   const removeDownload = useDeleteDownload();
   const redownload = useRedownloadDownload();
 
@@ -140,13 +147,18 @@ export default function DownloadDetailsWindow() {
   const failed = isFailed(item.status) || statusString(item.status) === "failed";
   const completed = statusString(item.status) === "completed";
   const adjustable = !failed && !completed;
-  const busy = controls.busy || extraBusy;
+  const caps = runtimeControlCapabilities(item);
+  const busy = controls.busy || extraBusy || controlBusy !== null;
   const segments = isSegmentItem(item.content_type, item.file_name);
   const { code, message } = failureText(item.status, item.error_message);
   const detail = errorDetail(code, message);
-  const statusText = failed
-    ? (code != null ? `${t("status.failed")} · HTTP ${code}` : t("status.failed"))
-    : `${statusLabel(item.status)} · ${progress}%`;
+  const statusText = controlBusy === "proxy"
+    ? t("properties.switchingProxy")
+    : controlError
+      ? controlError
+      : failed
+        ? (code != null ? `${t("status.failed")} · HTTP ${code}` : t("status.failed"))
+        : `${statusLabel(item.status)} · ${progress}%`;
   const statusTitle = failed ? (detail || message || undefined) : undefined;
   const liveCount = liveConnectionCount(item);
   const connLabel = item.connections === 0
@@ -175,7 +187,7 @@ export default function DownloadDetailsWindow() {
       ? t("properties.supported")
       : t("properties.unknown");
 
-  const remember = (next: Partial<Pick<Draft, "conns" | "rate" | "proxy">>) => {
+  const commitDraft = (next: Partial<Pick<Draft, "conns" | "rate" | "proxy">>) => {
     setDraft({
       id: item.id,
       conns: next.conns ?? connValue,
@@ -183,17 +195,59 @@ export default function DownloadDetailsWindow() {
       proxy: next.proxy ?? proxyValue,
     });
   };
-  const applyConnections = (value: number) => {
-    remember({ conns: value });
-    void tauriClient.setDownloadConnections(item.id, value);
+  const controlErrorText = (err: unknown) => {
+    if (typeof err === "string" && err) return err;
+    if (err && typeof err === "object") {
+      const value = (err as { value?: unknown; message?: unknown }).value;
+      const message = (err as { message?: unknown }).message;
+      if (typeof value === "string" && value) return value;
+      if (typeof message === "string" && message) return message;
+      try {
+        return JSON.stringify(err);
+      } catch {
+        /* fall through */
+      }
+    }
+    return t("properties.controlFailed");
   };
-  const applyRate = (value: string) => {
-    remember({ rate: value });
-    void tauriClient.setDownloadRateLimit(item.id, Number(value) || 0);
+  const applyConnections = async (value: number) => {
+    if (controlBusy || !caps.connections) return;
+    setControlBusy("conn");
+    setControlError(null);
+    try {
+      await tauriClient.setDownloadConnections(item.id, value);
+      commitDraft({ conns: value });
+    } catch (err) {
+      setControlError(controlErrorText(err));
+    } finally {
+      setControlBusy(null);
+    }
   };
-  const applyProxy = (value: string) => {
-    remember({ proxy: value });
-    void tauriClient.setDownloadProxy(item.id, value);
+  const applyRate = async (value: string) => {
+    if (controlBusy || !caps.rateLimit) return;
+    setControlBusy("rate");
+    setControlError(null);
+    try {
+      await tauriClient.setDownloadRateLimit(item.id, Number(value) || 0);
+      commitDraft({ rate: value });
+    } catch (err) {
+      setControlError(controlErrorText(err));
+    } finally {
+      setControlBusy(null);
+    }
+  };
+  const applyProxy = async (value: string) => {
+    if (controlBusy || !caps.proxy) return;
+    setControlBusy("proxy");
+    setControlError(null);
+    try {
+      await tauriClient.setDownloadProxy(item.id, value);
+      commitDraft({ proxy: value });
+    } catch (err) {
+      setControlError(controlErrorText(err));
+    } finally {
+      setControlBusy(null);
+    }
   };
   const handleCancel = async () => {
     if (busy) return;
@@ -295,20 +349,26 @@ export default function DownloadDetailsWindow() {
       <div className="mt-2 flex items-center gap-1.5 border-t border-border px-2 py-1.5">
         {adjustable && (
           <>
-            <Select className="h-7 w-auto min-w-0 flex-1 px-1.5 text-[12px]" value={proxyValue} onChange={(e) => applyProxy(e.target.value)}>
-              <option value="">{t("properties.proxy")} {t("newDownload.noProxy")}</option>
+            <Select className="h-7 w-auto min-w-0 flex-1 px-1.5 text-[12px] disabled:opacity-50" value={proxyValue} disabled={!caps.proxy || controlBusy !== null} onChange={(e) => { void applyProxy(e.target.value); }}>
+              <option value="">{proxySelectLabel("", t("newDownload.noProxy"))}</option>
               {proxyOptions.map((name) => (
-                <option key={name} value={name}>{t("properties.proxy")} {name}</option>
+                <option key={name} value={name}>{proxySelectLabel(name, t("newDownload.noProxy"))}</option>
               ))}
             </Select>
-            <Select className="h-7 w-auto min-w-0 flex-1 px-1.5 text-[12px]" value={String(connValue)} onChange={(e) => applyConnections(Number(e.target.value))}>
+            <Select
+              className="h-7 w-auto min-w-0 flex-1 px-1.5 text-[12px] disabled:opacity-50"
+              value={String(connValue)}
+              disabled={!caps.connections || controlBusy !== null}
+              title={caps.connections ? undefined : t("properties.connectionsLocked")}
+              onChange={(e) => { void applyConnections(Number(e.target.value)); }}
+            >
               {connOptions.map((n) => (
                 <option key={n} value={n}>
-                  {t("properties.conn")} {n === 0 ? autoOption : n}
+                  {connectionOptionLabel(n, autoOption)}
                 </option>
               ))}
             </Select>
-            <Select className="h-7 w-auto min-w-0 flex-1 px-1.5 text-[12px]" value={String(rateBps)} onChange={(e) => applyRate(e.target.value)}>
+            <Select className="h-7 w-auto min-w-0 flex-1 px-1.5 text-[12px] disabled:opacity-50" value={String(rateBps)} disabled={!caps.rateLimit || controlBusy !== null} onChange={(e) => { void applyRate(e.target.value); }}>
               {rateOptions.map((bps) => (
                 <option key={bps} value={bps}>{rateText(bps)}</option>
               ))}

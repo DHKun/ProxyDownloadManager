@@ -4,8 +4,9 @@ use crate::event_handler::{transform_event, EventAction};
 use crate::logger::Logger;
 use crate::services::settings_service::SettingsService;
 use crate::state::ledger::ProgressLedger;
+use crate::types::engine_config::item_is_hls;
 use crate::types::*;
-use crate::worker::{Admission, WorkerPool};
+use crate::worker::{Admission, PendingPatch, WorkerPool};
 use std::sync::{Arc, Mutex};
 
 pub struct DownloadManager {
@@ -418,39 +419,149 @@ impl DownloadManager {
     }
 
     pub async fn set_runtime_connections(&self, id: u64, connections: u32) -> PdmResult<()> {
+        let item = self.ledger.get_item(id)?.ok_or(PdmError::NotFound(id))?;
+        let caps = runtime_control_capabilities(&item.status, item.resumable, item_is_hls(&item));
+        if !caps.connections {
+            return Err(PdmError::Unsupported(
+                "connections cannot be changed in this state".into(),
+            ));
+        }
         let applied = if connections == 0 {
-            let size = self
-                .ledger
-                .get_item(id)
-                .ok()
-                .flatten()
-                .map(|item| item.total_size)
-                .unwrap_or(0);
-            crate::engine::chunk::auto_connections(size).min(crate::engine::chunk::MAX_CONNECTIONS)
+            crate::engine::chunk::auto_connections(item.total_size)
+                .min(crate::engine::chunk::MAX_CONNECTIONS)
         } else {
             connections
                 .min(crate::engine::chunk::MAX_CONNECTIONS)
                 .max(1)
         };
-        // 0 stays stored as Auto; the pool receives the size-based count.
-        self.ledger
-            .update_connections(id, if connections == 0 { 0 } else { applied })?;
-        let _ = self.worker_pool.set_connections(id, applied).await;
+        // 0 stays stored as Auto; a live worker receives the size-based count.
+        let stored = if connections == 0 { 0 } else { applied };
+        let previous = item.connections;
+        self.ledger.update_connections(id, stored)?;
+        if item.status.is_live() {
+            if !self.worker_pool.set_connections(id, applied).await {
+                let _ = self.ledger.update_connections(id, previous);
+                return Err(PdmError::Other(
+                    "download is not running, connections were not changed".into(),
+                ));
+            }
+        } else if matches!(item.status, DownloadStatus::Queued) {
+            if !self
+                .worker_pool
+                .configure_pending(
+                    id,
+                    PendingPatch {
+                        connections: Some(stored),
+                        ..PendingPatch::default()
+                    },
+                )
+                .await
+            {
+                let _ = self.ledger.update_connections(id, previous);
+                return Err(PdmError::Other(
+                    "download is no longer queued, connections were not changed".into(),
+                ));
+            }
+        }
         Ok(())
     }
 
-    /// Store the proxy name used on the next resume. The live worker keeps its
-    /// current client until then.
-    pub fn set_stored_proxy(&self, id: u64, proxy_name: String) -> PdmResult<()> {
-        self.ledger.update_proxy_name(id, proxy_name)
+    /// Change the proxy the download will use.
+    /// An active resumable HTTP download is paused, the name is stored, then
+    /// the same id resumes so the new client is built from that name. A failed
+    /// resume leaves the row paused with its temp file and progress intact.
+    pub async fn switch_download_proxy(&self, id: u64, proxy_name: String) -> PdmResult<()> {
+        let item = self.ledger.get_item(id)?.ok_or(PdmError::NotFound(id))?;
+        let caps = runtime_control_capabilities(&item.status, item.resumable, item_is_hls(&item));
+        if !caps.proxy {
+            return Err(PdmError::Unsupported(
+                "proxy cannot be changed in this state".into(),
+            ));
+        }
+        if item.status.is_live() {
+            self.pause_download(id).await?;
+            let after = self.ledger.get_item(id)?.ok_or(PdmError::NotFound(id))?;
+            if !matches!(after.status, DownloadStatus::Paused) {
+                return Err(PdmError::Other(
+                    "download could not be paused to switch proxy".into(),
+                ));
+            }
+            self.ledger.update_proxy_name(id, proxy_name)?;
+            return self.resume_download(id).await;
+        }
+        if matches!(item.status, DownloadStatus::Paused) {
+            return self.ledger.update_proxy_name(id, proxy_name);
+        }
+        if matches!(item.status, DownloadStatus::Queued) {
+            let previous = item.proxy_name.clone();
+            self.ledger.update_proxy_name(id, proxy_name.clone())?;
+            let url = self
+                .settings
+                .resolve_proxy_url(&proxy_name)
+                .unwrap_or_default();
+            if !self
+                .worker_pool
+                .configure_pending(
+                    id,
+                    PendingPatch {
+                        proxy_url: Some(url),
+                        proxy_name: Some(proxy_name),
+                        ..PendingPatch::default()
+                    },
+                )
+                .await
+            {
+                let _ = self.ledger.update_proxy_name(id, previous);
+                return Err(PdmError::Other(
+                    "download is no longer queued, proxy was not changed".into(),
+                ));
+            }
+            return Ok(());
+        }
+        Err(PdmError::Unsupported(
+            "proxy cannot be changed in this state".into(),
+        ))
     }
 
     pub async fn set_runtime_rate_limit(&self, id: u64, rate_limit_bps: u64) -> PdmResult<()> {
+        let item = self.ledger.get_item(id)?.ok_or(PdmError::NotFound(id))?;
+        let caps = runtime_control_capabilities(&item.status, item.resumable, item_is_hls(&item));
+        if !caps.rate_limit {
+            return Err(PdmError::Unsupported(
+                "rate limit cannot be changed in this state".into(),
+            ));
+        }
+        let previous = item.rate_limit_bps;
         self.ledger.update_rate_limit(id, rate_limit_bps)?;
-        let _ = self
-            .worker_pool
-            .set_download_rate_limit(id, rate_limit_bps)
-            .await;
+        if item.status.is_live() {
+            if !self
+                .worker_pool
+                .set_download_rate_limit(id, rate_limit_bps)
+                .await
+            {
+                let _ = self.ledger.update_rate_limit(id, previous);
+                return Err(PdmError::Other(
+                    "download is not running, rate limit was not changed".into(),
+                ));
+            }
+        } else if matches!(item.status, DownloadStatus::Queued) {
+            if !self
+                .worker_pool
+                .configure_pending(
+                    id,
+                    PendingPatch {
+                        rate_limit_bps: Some(rate_limit_bps),
+                        ..PendingPatch::default()
+                    },
+                )
+                .await
+            {
+                let _ = self.ledger.update_rate_limit(id, previous);
+                return Err(PdmError::Other(
+                    "download is no longer queued, rate limit was not changed".into(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -661,6 +772,57 @@ impl DownloadManager {
     }
 }
 
+/// Which detail-window controls the engine will actually honor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeCaps {
+    pub proxy: bool,
+    pub connections: bool,
+    pub rate_limit: bool,
+}
+
+pub fn runtime_control_capabilities(
+    status: &DownloadStatus,
+    resumable: Option<bool>,
+    is_hls: bool,
+) -> RuntimeCaps {
+    let none = RuntimeCaps {
+        proxy: false,
+        connections: false,
+        rate_limit: false,
+    };
+    match status {
+        DownloadStatus::Completed | DownloadStatus::Failed(_) => none,
+        // Paused values are stored and used on the next resume.
+        DownloadStatus::Paused => RuntimeCaps {
+            proxy: true,
+            connections: true,
+            rate_limit: true,
+        },
+        // Queued values are written into the pending engine config. A
+        // non-range HTTP download never reads the connection count.
+        DownloadStatus::Queued => RuntimeCaps {
+            proxy: true,
+            connections: is_hls || resumable != Some(false),
+            rate_limit: true,
+        },
+        _ => {
+            if is_hls || resumable == Some(false) {
+                RuntimeCaps {
+                    proxy: false,
+                    connections: false,
+                    rate_limit: true,
+                }
+            } else {
+                RuntimeCaps {
+                    proxy: true,
+                    connections: true,
+                    rate_limit: true,
+                }
+            }
+        }
+    }
+}
+
 pub fn apply_conflict_policy(
     dir: &str,
     filename: &str,
@@ -729,6 +891,63 @@ struct DownloadSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_caps_follow_what_the_engine_can_apply() {
+        let all = RuntimeCaps {
+            proxy: true,
+            connections: true,
+            rate_limit: true,
+        };
+        let rate_only = RuntimeCaps {
+            proxy: false,
+            connections: false,
+            rate_limit: true,
+        };
+        let none = RuntimeCaps {
+            proxy: false,
+            connections: false,
+            rate_limit: false,
+        };
+        assert_eq!(
+            runtime_control_capabilities(&DownloadStatus::Paused, Some(false), true),
+            all
+        );
+        assert_eq!(
+            runtime_control_capabilities(&DownloadStatus::Downloading, Some(true), false),
+            all
+        );
+        assert_eq!(
+            runtime_control_capabilities(&DownloadStatus::Connecting, None, false),
+            all
+        );
+        assert_eq!(
+            runtime_control_capabilities(&DownloadStatus::Downloading, Some(false), false),
+            rate_only
+        );
+        assert_eq!(
+            runtime_control_capabilities(&DownloadStatus::Retrying, Some(true), true),
+            rate_only
+        );
+        assert_eq!(
+            runtime_control_capabilities(&DownloadStatus::Completed, Some(true), false),
+            none
+        );
+        assert_eq!(
+            runtime_control_capabilities(
+                &DownloadStatus::Failed("HTTP 403".into()),
+                Some(true),
+                false
+            ),
+            none
+        );
+        let queued_single =
+            runtime_control_capabilities(&DownloadStatus::Queued, Some(false), false);
+        assert!(queued_single.proxy && queued_single.rate_limit);
+        assert!(!queued_single.connections);
+        let queued_hls = runtime_control_capabilities(&DownloadStatus::Queued, Some(false), true);
+        assert!(queued_hls.connections);
+    }
 
     #[test]
     fn test_unique_filename_no_conflict() {

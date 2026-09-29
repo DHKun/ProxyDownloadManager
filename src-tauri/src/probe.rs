@@ -48,11 +48,11 @@ pub async fn probe(
                 .map(|(i, _)| i)
                 .unwrap_or(ua.len())]
         );
-        // Try Range first to detect 206 support
-        let mut range_req = client.get(url);
-        range_req = range_req.header("Range", "bytes=0-0");
+        // Try Range first to detect 206 support. Engine Range is applied last
+        // so a replayed Range cannot be appended beside bytes=0-0.
+        let mut range_req =
+            crate::headers::prepare_request(client.get(url), headers, ua, Some("bytes=0-0"));
         range_req = range_req.timeout(std::time::Duration::from_secs(30));
-        range_req = crate::headers::apply_headers(range_req, headers, ua);
 
         let resp = range_req.send().await;
         let resp = match resp {
@@ -94,9 +94,8 @@ pub async fn probe(
         } else if status == reqwest::StatusCode::FORBIDDEN
             || status == reqwest::StatusCode::METHOD_NOT_ALLOWED
         {
-            let mut get_req = client.get(url);
+            let mut get_req = crate::headers::prepare_request(client.get(url), headers, ua, None);
             get_req = get_req.timeout(std::time::Duration::from_secs(30));
-            get_req = crate::headers::apply_headers(get_req, headers, ua);
             match get_req.send().await {
                 Ok(r2) if r2.status().is_success() => r2
                     .headers()

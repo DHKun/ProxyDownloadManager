@@ -104,6 +104,17 @@ pub fn parse_message(text: &str) -> PendingDownloadRequest {
         })
 }
 
+/// First frame after the socket is up. The extension shows `version` and
+/// must not treat this frame as a download ACK.
+pub fn desktop_hello() -> String {
+    serde_json::json!({
+        "type": "hello",
+        "version": env!("CARGO_PKG_VERSION"),
+        "protocol_version": 1,
+    })
+    .to_string()
+}
+
 pub fn ack_json(ack: &DownloadAck) -> String {
     serde_json::to_string(ack)
         .unwrap_or_else(|_| r#"{"accepted":false,"reason":"serialize"}"#.into())
@@ -235,6 +246,11 @@ impl WsServer {
                 return;
             }
         };
+
+        if let Err(e) = ws.send(Message::Text(desktop_hello().into())) {
+            log::error!("[WS] hello send failed: {}", e);
+            return;
+        }
 
         loop {
             let msg = match ws.read() {
@@ -439,6 +455,15 @@ mod tests {
         assert!(req.request_id.is_empty());
         assert_eq!(route_request(&req), WsRoute::Forward);
         assert_eq!(route_request(&req), WsRoute::Forward);
+    }
+
+    #[test]
+    fn hello_carries_the_desktop_version_and_is_not_an_ack() {
+        let hello: serde_json::Value = serde_json::from_str(&desktop_hello()).unwrap();
+        assert_eq!(hello["type"], "hello");
+        assert_eq!(hello["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(hello["protocol_version"], 1);
+        assert!(hello.get("accepted").is_none());
     }
 
     #[test]

@@ -321,6 +321,32 @@ mod tests {
     }
 
     #[test]
+    fn auto_plan_for_large_file_is_many_parts_not_one() {
+        // The Kali ISO size. Auto must plan 32 parts that cover the file.
+        // compute_chunks(size, 1) is the old Auto bug: one full-file task.
+        let size = 4_831_174_656u64;
+        let plan = plan_chunks(size, 0, true, 64);
+        assert_eq!(plan.connections, 32);
+        assert_eq!(plan.parts.len(), 32);
+        let ranges: Vec<crate::engine::part_progress::PartRange> = plan
+            .parts
+            .iter()
+            .map(|p| crate::engine::part_progress::PartRange {
+                start: p.start,
+                end: p.end,
+            })
+            .collect();
+        let tasks = crate::engine::part_progress::remaining_tasks_from_parts(
+            &ranges,
+            &vec![0; ranges.len()],
+        );
+        assert_eq!(tasks.len(), 32);
+        assert_eq!(tasks.iter().map(|t| t.length).sum::<u64>(), size);
+        assert_eq!(compute_chunks(size, 1, 0).len(), 1);
+        assert_eq!(compute_chunks(size, 0, 0).len(), 1);
+    }
+
+    #[test]
     fn auto_connections_follows_size_buckets() {
         assert_eq!(auto_connections(1024), 1);
         assert_eq!(auto_connections(3 * 1024 * 1024), 4);

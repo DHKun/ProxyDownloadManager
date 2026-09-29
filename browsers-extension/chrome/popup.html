@@ -31,6 +31,7 @@
         background: var(--muted);
       }
       h1 { font-size: 13px; margin: 0; font-weight: 600; }
+      #versions { margin-top: 2px; }
       .dot { width: 8px; height: 8px; border-radius: 999px; display: inline-block; margin-right: 6px; }
       .on { background: var(--foreground); }
       .off { background: var(--destructive); }
@@ -80,7 +81,10 @@
   </head>
   <body>
     <header>
-      <h1>ProxyDM</h1>
+      <div>
+        <h1>ProxyDM</h1>
+        <div id="versions" class="muted"></div>
+      </div>
       <div id="conn"></div>
     </header>
     <section>

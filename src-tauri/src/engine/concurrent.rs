@@ -1,6 +1,8 @@
 use crate::engine::chunk::{self, ChunkQueue};
 use crate::engine::file_io::{create_output_file, finalize_file};
-use crate::engine::part_progress::{encode_progress_data, PartProgressTracker, PartRange};
+use crate::engine::part_progress::{
+    encode_progress_data, remaining_tasks_from_parts, PartProgressTracker, PartRange,
+};
 use crate::engine::task_download::{download_task, TaskResult};
 use crate::network::limiter::MultiLimiter;
 use crate::network::pool::NetworkPool;
@@ -53,9 +55,30 @@ impl ConcurrentDownloader {
                 cfg.downloaded
             );
             (cfg.resume_tasks.clone(), cfg.downloaded)
+        } else if !part_ranges.is_empty() {
+            // The UI progress map was planned from these ranges (Auto is stored
+            // as connections=0). Tasks must be those ranges. Planning from
+            // connections.max(1) collapses Auto into one full-file request, so
+            // every segment stays at 0 B until that single body is written.
+            let downloaded = if cfg.part_downloaded.len() == part_ranges.len() {
+                cfg.part_downloaded.clone()
+            } else {
+                vec![0; part_ranges.len()]
+            };
+            (remaining_tasks_from_parts(&part_ranges, &downloaded), 0)
         } else {
+            let count = cfg
+                .desired_connections
+                .as_ref()
+                .map(|a| a.load(Ordering::Relaxed))
+                .filter(|n| *n > 0)
+                .unwrap_or(if cfg.connections > 0 {
+                    cfg.connections
+                } else {
+                    chunk::auto_connections(cfg.total_size)
+                });
             (
-                chunk::compute_chunks(cfg.total_size, cfg.connections.max(1), 0),
+                chunk::compute_chunks(cfg.total_size, count.max(1).min(chunk::MAX_CONNECTIONS), 0),
                 0,
             )
         };
@@ -436,13 +459,51 @@ fn spawn_chunk_worker(env: ChunkWorker) -> tokio::task::JoinHandle<()> {
                     retries_left = env.max_retries;
                 }
                 TaskResult::Partial { remaining } => {
-                    log::debug!(
-                        "[ProxyDM] task offset={} partial, re-queueing {} bytes",
-                        task.offset,
-                        remaining.length
-                    );
-                    env.queue.push(remaining);
-                    retries_left = env.max_retries;
+                    let zero_progress =
+                        remaining.offset == task.offset && remaining.length == task.length;
+                    let pausing = env.stop.load(Ordering::Relaxed);
+                    if pausing || !zero_progress {
+                        log::debug!(
+                            "[ProxyDM] task offset={} partial, re-queueing {} bytes",
+                            task.offset,
+                            remaining.length
+                        );
+                        env.queue.push(remaining);
+                        if !zero_progress {
+                            retries_left = env.max_retries;
+                        }
+                    } else if retries_left == 0 {
+                        log::error!(
+                            "[ProxyDM] chunk offset={} made no progress, retries exhausted",
+                            task.offset
+                        );
+                        abort(
+                            task,
+                            PdmError::RetriesExhausted("chunk made no progress".into()),
+                        );
+                        stop_worker(&env.live_workers);
+                        return;
+                    } else {
+                        retries_left -= 1;
+                        log::warn!(
+                            "[ProxyDM] chunk offset={} made no progress, retries left={}",
+                            task.offset,
+                            retries_left
+                        );
+                        env.queue.push(task);
+                        emit_phase(&env.event_tx, env.download_id, "retrying");
+                        let attempt = env.max_retries - retries_left;
+                        let delay = crate::retry::backoff_delay(attempt);
+                        let deadline = std::time::Instant::now() + delay;
+                        while std::time::Instant::now() < deadline {
+                            if env.stop.load(Ordering::Relaxed) {
+                                stop_worker(&env.live_workers);
+                                return;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                        emit_phase(&env.event_tx, env.download_id, "downloading");
+                    }
                 }
                 TaskResult::Cancelled => {
                     // download_task returns Cancelled only after the popped

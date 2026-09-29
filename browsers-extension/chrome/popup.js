@@ -36,8 +36,19 @@ async function downloadMedia(item) {
   }
 }
 
+function versionLine(status) {
+  const ext = chrome.runtime.getManifest()?.version || "";
+  const dl = !status?.connected
+    ? t("dlOffline")
+    : status.downloaderVersion
+      ? `${t("dlVersion")} ${status.downloaderVersion}`
+      : t("dlVersion");
+  return `${t("extVersion")} ${ext} · ${dl}`;
+}
+
 async function refresh() {
   const status = await chrome.runtime.sendMessage({ action: "popup-status" });
+  $("versions").textContent = versionLine(status);
   const conn = $("conn");
   conn.innerHTML = status.connected
     ? `<span class="dot on"></span><span>${t("connected")}</span>`
