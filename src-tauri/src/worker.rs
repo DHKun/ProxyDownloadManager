@@ -37,6 +37,8 @@ struct ActiveDownload {
     handle: tokio::task::JoinHandle<()>,
     limiter: Arc<MultiLimiter>,
     desired_connections: Arc<AtomicU32>,
+    /// Auto may adapt `desired_connections`; a manual count never adapts.
+    automatic: Arc<AtomicBool>,
 }
 
 type ActiveMap = Arc<Mutex<HashMap<u64, ActiveDownload>>>;
@@ -49,11 +51,15 @@ struct SpawnCtx {
     event_tx: mpsc::UnboundedSender<Event>,
     active: ActiveMap,
     pending: Arc<Mutex<VecDeque<PendingDownload>>>,
+    /// `None` is unlimited: every download starts immediately. `Some` holds the
+    /// user's explicit concurrent-download limit. The holder is a `std::sync`
+    /// mutex because admission only does a non-blocking `try_acquire_owned`.
+    slots: Arc<std::sync::Mutex<Option<Arc<Semaphore>>>>,
     global_limiter: Arc<crate::network::limiter::RateLimiter>,
 }
 
 pub struct WorkerPool {
-    semaphore: Arc<Semaphore>,
+    slots: Arc<std::sync::Mutex<Option<Arc<Semaphore>>>>,
     pool: Arc<NetworkPool>,
     event_tx: mpsc::UnboundedSender<Event>,
     active: ActiveMap,
@@ -63,6 +69,9 @@ pub struct WorkerPool {
 }
 
 impl WorkerPool {
+    /// `max_workers == 0` means unlimited: downloads are never parked and the
+    /// pool only tracks/cancels them. A non-zero value is an explicit user
+    /// limit, in which case extra downloads queue FIFO.
     pub fn new(
         max_workers: u32,
         event_tx: mpsc::UnboundedSender<Event>,
@@ -70,15 +79,40 @@ impl WorkerPool {
         next_id_start: u64,
         global_rate_limit: u64,
     ) -> Self {
-        log::info!("WorkerPool starting next_id from {}", next_id_start);
+        log::info!(
+            "WorkerPool starting next_id from {} (max active downloads: {})",
+            next_id_start,
+            if max_workers == 0 {
+                "unlimited".to_string()
+            } else {
+                max_workers.to_string()
+            }
+        );
+        let slots = if max_workers == 0 {
+            None
+        } else {
+            Some(Arc::new(Semaphore::new(max_workers as usize)))
+        };
         Self {
-            semaphore: Arc::new(Semaphore::new(max_workers as usize)),
+            slots: Arc::new(std::sync::Mutex::new(slots)),
             pool: Arc::new(NetworkPool::new(danger_accept_invalid_certs)),
             event_tx,
             active: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(VecDeque::new())),
             next_id: AtomicU64::new(next_id_start),
             global_limiter: Arc::new(crate::network::limiter::RateLimiter::new(global_rate_limit)),
+        }
+    }
+
+    /// Try to reserve one running-download slot. `Ok(None)` is an unlimited
+    /// pool, `Ok(Some(permit))` a reserved slot, `Err(())` a full pool.
+    fn try_acquire_slot(
+        slots: &std::sync::Mutex<Option<Arc<Semaphore>>>,
+    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, ()> {
+        let guard = slots.lock().map_err(|_| ())?;
+        match guard.as_ref() {
+            None => Ok(None),
+            Some(sem) => sem.clone().try_acquire_owned().map(Some).map_err(|_| ()),
         }
     }
 
@@ -92,11 +126,12 @@ impl WorkerPool {
             event_tx: self.event_tx.clone(),
             active: self.active.clone(),
             pending: self.pending.clone(),
+            slots: self.slots.clone(),
             global_limiter: self.global_limiter.clone(),
         }
     }
 
-    /// Submit a download: runs now if a slot is free, otherwise parks it
+    /// Submit a download: runs now when a slot is free, otherwise parks it
     /// (Queued 状态机 admission). Idempotent for an id that is already parked.
     pub async fn add_with_id(
         &self,
@@ -116,13 +151,13 @@ impl WorkerPool {
                 id
             )));
         }
-        match self.semaphore.clone().try_acquire_owned() {
+        match Self::try_acquire_slot(&self.slots) {
             Ok(permit) => {
                 let active = Self::launch(self.ctx(), cfg, permit, id, hooks);
                 self.active.lock().await.insert(id, active);
                 Ok(Admission::Started)
             }
-            Err(_) => {
+            Err(()) => {
                 log::info!("[ProxyDM] id={} queued (all slots busy)", id);
                 self.pending
                     .lock()
@@ -133,13 +168,13 @@ impl WorkerPool {
         }
     }
 
-    /// Spawn the engine task for one download. At task end the permit is
-    /// handed directly to the next queued download (FIFO, no release/acquire
-    /// race) or dropped when the queue is empty.
+    /// Spawn the engine task for one download. At task end the slot is released
+    /// and the next queued download is dispatched (FIFO), re-reading the
+    /// current semaphore so a runtime limit change is honored.
     fn launch(
         ctx: SpawnCtx,
         mut cfg: EngineConfig,
-        permit: tokio::sync::OwnedSemaphorePermit,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
         id: u64,
         hooks: EngineHooks,
     ) -> ActiveDownload {
@@ -169,6 +204,11 @@ impl WorkerPool {
             .clone()
             .unwrap_or_else(|| Arc::new(AtomicU32::new(initial)));
         cfg.desired_connections = Some(desired.clone());
+        // Auto is decided here once: stored connections 0 means the engine may
+        // adapt the target; a manual count is passed through untouched.
+        let auto = Arc::new(AtomicBool::new(cfg.connections == 0));
+        cfg.auto_connections = cfg.connections == 0;
+        cfg.auto_flag = Some(auto.clone());
         log::debug!(
             "[rate] id={} global={} task={}",
             id,
@@ -231,24 +271,60 @@ impl WorkerPool {
                 );
             }
 
-            // FIFO handoff to the next queued download.
-            let next = ctx.pending.lock().await.pop_front();
-            match next {
-                Some(p) => {
-                    log::info!("[ProxyDM] slot handoff → queued id={}", p.id);
-                    let ctx_next = ctx.clone();
-                    let next_active = Self::launch(ctx_next.clone(), p.cfg, permit, p.id, p.hooks);
-                    ctx_next.active.lock().await.insert(p.id, next_active);
-                }
-                None => drop(permit),
-            }
+            // Release the running slot before dispatching, so a free slot is
+            // visible to the queue (and to a concurrent finisher).
+            drop(permit);
+            Self::dispatch_pending(&ctx).await;
         });
         ActiveDownload {
             cancel,
             handle,
             limiter,
             desired_connections: desired,
+            automatic: auto,
         }
+    }
+
+    /// Drain the FIFO queue into every free slot. Called when a running
+    /// download finishes and when the limit changes.
+    async fn dispatch_pending(ctx: &SpawnCtx) {
+        loop {
+            let permit = match Self::try_acquire_slot(&ctx.slots) {
+                Ok(p) => p,
+                Err(()) => return,
+            };
+            let next = ctx.pending.lock().await.pop_front();
+            let Some(p) = next else {
+                drop(permit);
+                return;
+            };
+            log::info!("[ProxyDM] slot handoff → queued id={}", p.id);
+            let next_ctx = ctx.clone();
+            let active = Self::launch(next_ctx.clone(), p.cfg, permit, p.id, p.hooks);
+            next_ctx.active.lock().await.insert(p.id, active);
+        }
+    }
+
+    /// Change the number of simultaneously running downloads. `0` means
+    /// unlimited. Queued downloads start immediately when the new limit allows.
+    pub async fn set_max_active(&self, max_active: u32) {
+        let slots = if max_active == 0 {
+            None
+        } else {
+            Some(Arc::new(Semaphore::new(max_active as usize)))
+        };
+        if let Ok(mut guard) = self.slots.lock() {
+            *guard = slots;
+        }
+        log::info!(
+            "[ProxyDM] max active downloads = {}",
+            if max_active == 0 {
+                "unlimited".to_string()
+            } else {
+                max_active.to_string()
+            }
+        );
+        Self::dispatch_pending(&self.ctx()).await;
     }
 
     /// Cancel a download by setting its cancel flag and removing it from the active map.
@@ -334,7 +410,21 @@ impl WorkerPool {
         let n = connections.clamp(1, crate::engine::chunk::MAX_CONNECTIONS);
         let active = self.active.lock().await;
         if let Some(entry) = active.get(&id) {
+            // An explicit count is manual: stop adapting this download.
+            entry.automatic.store(false, Ordering::Relaxed);
             entry.desired_connections.store(n, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Switch a running download back to Auto. The adaptive controller keeps
+    /// the current worker count as its starting level and adapts from there.
+    pub async fn set_auto(&self, id: u64) -> bool {
+        let active = self.active.lock().await;
+        if let Some(entry) = active.get(&id) {
+            entry.automatic.store(true, Ordering::Relaxed);
             true
         } else {
             false
@@ -390,6 +480,8 @@ mod tests {
             part_ranges: vec![(0, 100)],
             part_downloaded: vec![],
             desired_connections: None,
+            auto_connections: false,
+            auto_flag: None,
             is_hls: false,
         }
     }
@@ -488,7 +580,17 @@ mod tests {
     #[tokio::test]
     async fn configure_pending_updates_queued_config_only() {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let pool = WorkerPool::new(0, tx, false, 1, 0);
+        let pool = WorkerPool::new(1, tx, false, 1, 0);
+        let slow_url = spawn_slow_server().await;
+        let mut running = test_config();
+        running.url = slow_url;
+        let running_id = pool.next_id();
+        let admission = pool
+            .add_with_id(running, running_id, hooks())
+            .await
+            .unwrap();
+        assert_eq!(admission, Admission::Started);
+
         let id = pool.next_id();
         let admission = pool.add_with_id(test_config(), id, hooks()).await.unwrap();
         assert_eq!(admission, Admission::Queued);
@@ -512,6 +614,89 @@ mod tests {
         assert_eq!(cfg.rate_limit_bps, 1024);
         drop(pending);
         assert!(!pool.configure_pending(999, PendingPatch::default()).await);
+        pool.cancel_and_wait(running_id).await;
+        pool.cancel_and_wait(id).await;
+    }
+
+    #[tokio::test]
+    async fn unlimited_pool_starts_every_download() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let pool = WorkerPool::new(0, tx, false, 1, 0);
+        let slow_url = spawn_slow_server().await;
+
+        let mut ids = Vec::new();
+        for _ in 0..12 {
+            let mut cfg = test_config();
+            cfg.url = slow_url.clone();
+            let id = pool.next_id();
+            let admission = pool.add_with_id(cfg, id, hooks()).await.unwrap();
+            assert_eq!(
+                admission,
+                Admission::Started,
+                "unlimited pool must not queue"
+            );
+            ids.push(id);
+        }
+        assert!(
+            pool.pending.lock().await.is_empty(),
+            "nothing may be parked without an explicit limit"
+        );
+        assert_eq!(pool.active.lock().await.len(), 12);
+
+        for id in ids {
+            pool.cancel_and_wait(id).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn set_max_active_limits_and_later_releases_the_queue() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let pool = WorkerPool::new(0, tx, false, 1, 0);
+        let slow_url = spawn_slow_server().await;
+
+        pool.set_max_active(1).await;
+
+        let mut a = test_config();
+        a.url = slow_url.clone();
+        let id_a = pool.next_id();
+        assert_eq!(
+            pool.add_with_id(a, id_a, hooks()).await.unwrap(),
+            Admission::Started
+        );
+
+        let mut b = test_config();
+        b.url = slow_url.clone();
+        let id_b = pool.next_id();
+        assert_eq!(
+            pool.add_with_id(b, id_b, hooks()).await.unwrap(),
+            Admission::Queued
+        );
+
+        // Cancelling the running download frees the slot; the queued one starts.
+        pool.cancel_and_wait(id_a).await;
+        for _ in 0..100 {
+            if pool.active.lock().await.contains_key(&id_b) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            pool.active.lock().await.contains_key(&id_b),
+            "queued download never started after the slot was freed"
+        );
+
+        // Back to unlimited: new downloads start without waiting.
+        pool.set_max_active(0).await;
+        let mut c = test_config();
+        c.url = slow_url.clone();
+        let id_c = pool.next_id();
+        assert_eq!(
+            pool.add_with_id(c, id_c, hooks()).await.unwrap(),
+            Admission::Started
+        );
+
+        pool.cancel_and_wait(id_b).await;
+        pool.cancel_and_wait(id_c).await;
     }
 
     #[tokio::test]

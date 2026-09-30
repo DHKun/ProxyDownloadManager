@@ -446,7 +446,14 @@ impl DownloadManager {
         let previous = item.connections;
         self.ledger.update_connections(id, stored)?;
         if item.status.is_live() {
-            if !self.worker_pool.set_connections(id, applied).await {
+            // Auto means the engine keeps adapting; an explicit count means the
+            // engine stops adapting and holds exactly what the user picked.
+            let applied_ok = if stored == 0 {
+                self.worker_pool.set_auto(id).await
+            } else {
+                self.worker_pool.set_connections(id, applied).await
+            };
+            if !applied_ok {
                 let _ = self.ledger.update_connections(id, previous);
                 return Err(PdmError::Other(
                     "download is not running, connections were not changed".into(),
@@ -574,6 +581,12 @@ impl DownloadManager {
 
     pub fn set_global_rate_limit(&self, bps: u64) {
         self.worker_pool.set_global_rate_limit(bps);
+    }
+
+    /// Change how many downloads may run at once. `0` is unlimited; queued
+    /// downloads start immediately when the new limit allows.
+    pub async fn set_max_active_downloads(&self, max_active: u32) {
+        self.worker_pool.set_max_active(max_active).await;
     }
 
     pub async fn refresh_url(

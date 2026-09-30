@@ -1,3 +1,4 @@
+use crate::engine::adaptive::{self, AdaptiveConfig, AdaptiveController};
 use crate::engine::chunk::{self, ChunkQueue};
 use crate::engine::file_io::{create_output_file, finalize_file};
 use crate::engine::part_progress::{
@@ -6,9 +7,11 @@ use crate::engine::part_progress::{
 use crate::engine::task_download::{download_task, TaskResult};
 use crate::network::limiter::MultiLimiter;
 use crate::network::pool::NetworkPool;
+use crate::network::protocol::PerfStats;
 use crate::types::{EngineConfig, Event, EventKind, PdmError, PdmResult};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 pub struct ConcurrentDownloader {
@@ -83,6 +86,7 @@ impl ConcurrentDownloader {
             )
         };
         let bytes_written = Arc::new(AtomicU64::new(resume_offset));
+        let perf = Arc::new(PerfStats::new(cfg.id));
 
         let parts_tracker = PartProgressTracker::new(part_ranges);
         if !cfg.part_downloaded.is_empty() {
@@ -223,6 +227,7 @@ impl ConcurrentDownloader {
             download_id,
             expected_total: cfg.total_size,
             phase: phase.clone(),
+            perf: perf.clone(),
         };
 
         for _worker_id in 0..num_workers {
@@ -260,6 +265,66 @@ impl ConcurrentDownloader {
             })
         };
 
+        // Adaptive Auto: watches measured throughput and moves `desired` one
+        // step at a time. It is dormant while the download is Manual — manual
+        // counts are never rewritten — and wakes up if the user switches a live
+        // download back to Auto.
+        let auto_flag = cfg
+            .auto_flag
+            .clone()
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(cfg.auto_connections)));
+        let adaptive_ceiling = adaptive::ceiling_for(cfg.total_size);
+        let controller_handle = {
+            let stop = stop.clone();
+            let desired = desired.clone();
+            let auto_flag = auto_flag.clone();
+            let perf = perf.clone();
+            let bytes_written = bytes_written.clone();
+            let live_workers = live_workers.clone();
+            tokio::spawn(async move {
+                let cfg = AdaptiveConfig::default();
+                let mut ctrl = AdaptiveController::new(num_workers, adaptive_ceiling, cfg.clone());
+                let mut window_bytes = bytes_written.load(Ordering::Relaxed);
+                let mut window_at = Instant::now();
+                let mut summary_at = Instant::now();
+                loop {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let now = Instant::now();
+                    let bytes = bytes_written.load(Ordering::Relaxed);
+
+                    if now.duration_since(summary_at) >= PerfStats::summary_interval() {
+                        perf.log_summary(live_workers.load(Ordering::Relaxed), bytes);
+                        summary_at = now;
+                    }
+
+                    let current = desired.load(Ordering::Relaxed).max(1);
+                    if !auto_flag.load(Ordering::Relaxed) {
+                        ctrl.sync(current, now);
+                        window_bytes = bytes;
+                        window_at = now;
+                        continue;
+                    }
+                    let elapsed = now.duration_since(window_at);
+                    let delta = bytes.saturating_sub(window_bytes);
+                    if elapsed < cfg.min_window || delta < cfg.min_bytes {
+                        continue;
+                    }
+                    let bps = delta as f64 / elapsed.as_secs_f64();
+                    if let Some(next) = ctrl.observe(now, bps, perf.errors()) {
+                        desired.store(next, Ordering::Relaxed);
+                    }
+                    window_bytes = bytes;
+                    window_at = now;
+                }
+            })
+        };
+
         for h in handles {
             let _ = h.await;
         }
@@ -275,6 +340,7 @@ impl ConcurrentDownloader {
         log::info!("[ProxyDM] concurrent id={} all workers done", cfg.id);
 
         stop.store(true, Ordering::Relaxed);
+        let _ = controller_handle.await;
         let _ = forwarder_handle.await;
         reporter_stop.store(true, Ordering::Relaxed);
         let _ = reporter_handle.await;
@@ -362,6 +428,7 @@ struct ChunkWorker {
     download_id: u64,
     expected_total: u64,
     phase: Arc<PhaseCounts>,
+    perf: Arc<PerfStats>,
 }
 
 impl Clone for ChunkWorker {
@@ -385,6 +452,7 @@ impl Clone for ChunkWorker {
             download_id: self.download_id,
             expected_total: self.expected_total,
             phase: self.phase.clone(),
+            perf: self.perf.clone(),
         }
     }
 }
@@ -505,6 +573,7 @@ fn spawn_chunk_worker(env: ChunkWorker) -> tokio::task::JoinHandle<()> {
                 env.headers.as_ref(),
                 env.expected_total,
                 crate::engine::task_download::BODY_IDLE,
+                Some(env.perf.as_ref()),
             )
             .await;
             env.phase.working.fetch_sub(1, Ordering::Relaxed);
@@ -523,6 +592,11 @@ fn spawn_chunk_worker(env: ChunkWorker) -> tokio::task::JoinHandle<()> {
                             task.offset,
                             remaining.length
                         );
+                        if !zero_progress && !pausing {
+                            // A transfer that stopped mid-range (body idle or a
+                            // dropped stream) is a stall, not a clean pause.
+                            env.perf.note_stall();
+                        }
                         env.queue.push(remaining);
                         if !zero_progress {
                             retries_left = env.max_retries;
@@ -532,6 +606,7 @@ fn spawn_chunk_worker(env: ChunkWorker) -> tokio::task::JoinHandle<()> {
                             "[ProxyDM] chunk offset={} made no progress, retries exhausted",
                             task.offset
                         );
+                        env.perf.note_stall();
                         abort(
                             task,
                             PdmError::RetriesExhausted("chunk made no progress".into()),
@@ -540,6 +615,7 @@ fn spawn_chunk_worker(env: ChunkWorker) -> tokio::task::JoinHandle<()> {
                         return;
                     } else {
                         retries_left -= 1;
+                        env.perf.note_retry();
                         log::warn!(
                             "[ProxyDM] chunk offset={} made no progress, retries left={}",
                             task.offset,
@@ -593,6 +669,7 @@ fn spawn_chunk_worker(env: ChunkWorker) -> tokio::task::JoinHandle<()> {
                         return;
                     }
                     retries_left -= 1;
+                    env.perf.note_retry();
                     env.queue.push(task);
                     env.phase.retrying.fetch_add(1, Ordering::Relaxed);
                     publish_phase(&env.phase, &env.event_tx, env.download_id);

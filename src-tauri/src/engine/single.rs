@@ -3,6 +3,7 @@ use crate::engine::part_progress::encode_progress_data;
 use crate::engine::task_download::{parse_content_range, validate_content_range};
 use crate::network::limiter::MultiLimiter;
 use crate::network::pool::NetworkPool;
+use crate::network::protocol::PerfStats;
 use crate::types::{EngineConfig, Event, EventKind, PdmError, PdmResult};
 use std::io::{Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,6 +28,7 @@ impl SingleDownloader {
         on_resume: &crate::engine::OnResumeState,
     ) -> PdmResult<()> {
         log::info!("[ProxyDM] single id={} url={}", cfg.id, cfg.url);
+        let perf = PerfStats::new(cfg.id);
         let resume_from = if cfg.is_resume && cfg.downloaded > 0 {
             cfg.downloaded
         } else {
@@ -56,6 +58,13 @@ impl SingleDownloader {
             Err(e) => return Err(PdmError::Network(e.to_string())),
         };
         log::info!("[ProxyDM] single id={} HTTP {}", cfg.id, resp.status());
+        perf.note_header(resp.version());
+        log::debug!(
+            "[net] id={} protocol={} status={}",
+            cfg.id,
+            crate::network::protocol::protocol_label(resp.version()),
+            resp.status().as_u16()
+        );
 
         if cancel.load(Ordering::Relaxed) {
             return Err(PdmError::Cancelled);
@@ -255,6 +264,7 @@ impl SingleDownloader {
             if chunk.is_empty() {
                 continue;
             }
+            perf.note_body();
             limiter.wait_n(chunk.len() as u64).await;
             last_byte = std::time::Instant::now();
             buf.extend_from_slice(&chunk);
@@ -271,6 +281,11 @@ impl SingleDownloader {
                     download_id: cfg.id,
                     data: Some(encode_progress_data(total, &[total], true)),
                 });
+            }
+
+            if total > 0 {
+                // Idempotent: reports the first byte that reached the file.
+                perf.note_progress();
             }
         }
 

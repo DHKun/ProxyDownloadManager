@@ -74,6 +74,7 @@ pub async fn probe(
             }
         };
         let status = resp.status();
+        let protocol = crate::network::protocol::protocol_label(resp.version());
 
         let supports_range = status == reqwest::StatusCode::PARTIAL_CONTENT;
 
@@ -116,6 +117,8 @@ pub async fn probe(
             return Err(PdmError::Probe(format!("HTTP {}", status)));
         };
 
+        // Every field is extracted before the body is touched: draining moves
+        // `resp`, and the metadata must survive that.
         let content_type = resp
             .headers()
             .get("content-type")
@@ -143,6 +146,11 @@ pub async fn probe(
         let is_hls = content_type.contains("mpegurl")
             || content_type.contains("x-mpegURL")
             || url.contains(".m3u8");
+        let content_length = resp
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
 
         let file_name = crate::filename::extract_filename(url, cd_owned.as_deref())
             .unwrap_or_else(|| "download".to_string());
@@ -154,6 +162,35 @@ pub async fn probe(
             file_size,
             file_name
         );
+        log::debug!(
+            "[net] probe protocol={} status={} range={} content_length={:?}",
+            protocol,
+            status.as_u16(),
+            supports_range,
+            content_length
+        );
+
+        // A `Range: bytes=0-0` 206 carries a tiny body (usually 1 byte).
+        // Consuming it releases the socket back to reqwest's idle pool, so the
+        // download that follows can reuse the warm TCP/TLS connection instead
+        // of paying for a new handshake. Only a *known, small* 206 body is ever
+        // read: a server that ignores Range and answers 200 with a multi-GB
+        // Content-Length is dropped, never drained.
+        if supports_range {
+            match content_length {
+                Some(n) if n <= MAX_DRAIN_BYTES => {
+                    let drained = resp.bytes().await.map(|b| b.len()).unwrap_or(0);
+                    log::debug!(
+                        "[net] probe drained {} byte(s) for connection reuse",
+                        drained
+                    );
+                }
+                _ => {
+                    log::debug!("[net] probe body not drained (unknown or large 206)");
+                }
+            }
+        }
+
         return Ok(ProbeResult {
             supports_range,
             file_size,
@@ -222,6 +259,11 @@ pub async fn probe_then_default_proxy(
 }
 
 const PROBE_TTL: Duration = Duration::from_secs(20);
+
+/// Largest probe response body that may be drained to return a connection to
+/// the pool. A `bytes=0-0` 206 is 1 byte; this only bounds a misbehaving
+/// server. Anything larger is dropped, never read into memory.
+const MAX_DRAIN_BYTES: u64 = 64 * 1024;
 
 struct ProbeCacheEntry {
     at: Instant,

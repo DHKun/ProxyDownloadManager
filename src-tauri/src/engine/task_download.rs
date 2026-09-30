@@ -2,6 +2,7 @@ use crate::engine::file_io::write_at;
 use crate::engine::part_progress::PartProgressTracker;
 use crate::headers::prepare_request;
 use crate::network::limiter::MultiLimiter;
+use crate::network::protocol::PerfStats;
 use crate::retry::{is_fatal_client_status, is_retryable_status};
 use crate::types::Task;
 use std::collections::HashMap;
@@ -42,13 +43,14 @@ fn flush_progress(
     bytes_written: &AtomicU64,
     parts: Option<&PartProgressTracker>,
     at: u64,
+    perf: Option<&PerfStats>,
 ) -> Result<u64, String> {
     if buf.is_empty() {
         return Ok(0);
     }
     write_at(file, buf, at).map_err(|e| e.to_string())?;
     let n = buf.len() as u64;
-    note_write(bytes_written, parts, at, n);
+    note_write(bytes_written, parts, at, n, perf);
     buf.clear();
     Ok(n)
 }
@@ -58,13 +60,18 @@ fn note_write(
     parts: Option<&PartProgressTracker>,
     file_offset: u64,
     len: u64,
+    perf: Option<&PerfStats>,
 ) {
     if len == 0 {
         return;
     }
     let prev = bytes_written.fetch_add(len, Ordering::Relaxed);
     if prev == 0 {
-        log::debug!("[startup] first-progress-byte");
+        if let Some(p) = perf {
+            p.note_progress();
+        } else {
+            log::debug!("[startup] first-progress-byte");
+        }
     }
     if let Some(p) = parts {
         p.record_write(file_offset, len);
@@ -183,6 +190,7 @@ pub async fn download_task(
     headers: &HashMap<String, String>,
     expected_total: u64,
     idle: Duration,
+    perf: Option<&PerfStats>,
 ) -> TaskResult {
     let mut written: u64 = 0;
     let range_end = if task.length == 0 {
@@ -213,6 +221,17 @@ pub async fn download_task(
             return TaskResult::Fatal(msg);
         }
     };
+
+    if let Some(p) = perf {
+        p.note_header(resp.version());
+        if task.offset == 0 {
+            log::debug!(
+                "[net] range_offset=0 protocol={} status={}",
+                crate::network::protocol::protocol_label(resp.version()),
+                resp.status().as_u16()
+            );
+        }
+    }
 
     if cancel.load(Ordering::Relaxed) {
         // Nothing written yet — hand the whole task back so the queue drain
@@ -340,6 +359,7 @@ pub async fn download_task(
                 bytes_written,
                 parts.as_deref(),
                 base_offset + written,
+                perf,
             ) {
                 Ok(n) => written += n,
                 Err(e) => return TaskResult::Fatal(format!("write_at error on cancel: {e}")),
@@ -368,7 +388,7 @@ pub async fn download_task(
             tokio::select! {
                 biased;
                 _ = tokio::time::sleep(flush_left) => {
-                    match flush_progress(file, &mut buf, bytes_written, parts.as_deref(), base_offset + written) {
+                    match flush_progress(file, &mut buf, bytes_written, parts.as_deref(), base_offset + written, perf) {
                         Ok(n) => written += n,
                         Err(e) => return TaskResult::Fatal(format!("write_at error: {e}")),
                     }
@@ -389,6 +409,7 @@ pub async fn download_task(
                     bytes_written,
                     parts.as_deref(),
                     base_offset + written,
+                    perf,
                 ) {
                     Ok(n) => written += n,
                     Err(err) => return TaskResult::Fatal(format!("write_at error: {err}")),
@@ -414,6 +435,7 @@ pub async fn download_task(
                     bytes_written,
                     parts.as_deref(),
                     base_offset + written,
+                    perf,
                 ) {
                     Ok(n) => written += n,
                     Err(e) => return TaskResult::Fatal(format!("write_at error: {e}")),
@@ -427,6 +449,7 @@ pub async fn download_task(
                     bytes_written,
                     parts.as_deref(),
                     base_offset + written,
+                    perf,
                 ) {
                     Ok(n) => written += n,
                     Err(e) => return TaskResult::Fatal(format!("write_at error: {e}")),
@@ -464,6 +487,9 @@ pub async fn download_task(
         if chunk.is_empty() {
             continue;
         }
+        if let Some(p) = perf {
+            p.note_body();
+        }
         limiter.wait_n(chunk.len() as u64).await;
         // Idle starts after throttling. A user limit must not look like a stall.
         last_byte = Instant::now();
@@ -489,6 +515,7 @@ pub async fn download_task(
                 bytes_written,
                 parts.as_deref(),
                 base_offset + written,
+                perf,
             ) {
                 Ok(n) => written += n,
                 Err(e) => return TaskResult::Fatal(format!("write_at error: {e}")),
@@ -511,6 +538,7 @@ pub async fn download_task(
                 bytes_written,
                 parts.as_deref(),
                 base_offset + written,
+                perf,
             ) {
                 Ok(n) => written += n,
                 Err(e) => return TaskResult::Fatal(format!("write_at error: {e}")),
@@ -733,6 +761,7 @@ mod tests {
             &HashMap::new(),
             len,
             idle,
+            None,
         )
         .await;
         let n = bytes.load(Ordering::Relaxed);
@@ -832,6 +861,7 @@ mod tests {
                 &HashMap::new(),
                 total,
                 Duration::from_secs(5),
+                None,
             )
             .await
         });

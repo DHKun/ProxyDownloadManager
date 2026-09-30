@@ -11,6 +11,7 @@ import type { FileConflictPolicy } from "../../types";
 
 const THREAD_OPTIONS = [0, 4, 8, 16, 32, 64];
 const RETRY_OPTIONS = [3, 5, 10, 20, 50];
+const MAX_ACTIVE_OPTIONS = [0, 1, 2, 4, 8, 16, 32];
 
 interface SettingsDialogProps {
   onClose: () => void;
@@ -51,6 +52,18 @@ export default function SettingsDialog({ onClose }: SettingsDialogProps) {
                 {RETRY_OPTIONS.map((n) => <option key={n} value={n}>{n}</option>)}
               </Select>
             </div>
+          </div>
+          <div className="max-w-xs">
+            <Label>{t("settings.maxActive")}</Label>
+            <Select
+              value={String(settings.max_active_downloads ?? 0)}
+              onChange={(e) => setSettings({ ...settings, max_active_downloads: Number(e.target.value) })}
+            >
+              {MAX_ACTIVE_OPTIONS.map((n) => (
+                <option key={n} value={n}>{n === 0 ? t("settings.unlimited") : String(n)}</option>
+              ))}
+            </Select>
+            <p className="text-[11px] text-muted-foreground">{t("settings.maxActiveHint")}</p>
           </div>
           <Label>{t("settings.fileConflict")}</Label>
           <Select value={settings.file_conflict || "rename"} onChange={(e) => setSettings({ ...settings, file_conflict: e.target.value as FileConflictPolicy })}>

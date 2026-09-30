@@ -73,6 +73,8 @@ export interface Settings {
   silent_startup: boolean;
   proxies: Record<string, ProxyConfig>;
   global_rate_limit: number;
+  /** Simultaneous downloads. `0` = unlimited (default); a number queues extras. */
+  max_active_downloads: number;
   default_proxy: string;
   home_dir: string;
   language: string;

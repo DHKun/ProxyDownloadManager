@@ -1,6 +1,6 @@
 use crate::types::{DownloadItem, Task};
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::Arc;
 
 /// Engine-facing download configuration.
@@ -29,6 +29,12 @@ pub struct EngineConfig {
     pub part_downloaded: Vec<u64>,
     /// Live worker target. `None` means use `connections`.
     pub desired_connections: Option<Arc<AtomicU32>>,
+    /// True when the stored connection count was 0 (Auto). Only Auto may adapt
+    /// `desired_connections`; a manual count is never changed by the engine.
+    pub auto_connections: bool,
+    /// Runtime Auto toggle. `None` falls back to `auto_connections`. The worker
+    /// pool flips this when the user switches a live download to/from Auto.
+    pub auto_flag: Option<Arc<AtomicBool>>,
     /// HLS playlist download. Runs through the same worker slot as HTTP.
     pub is_hls: bool,
 }
@@ -96,6 +102,8 @@ impl DownloadItem {
             part_ranges,
             part_downloaded,
             desired_connections: None,
+            auto_connections: self.connections == 0,
+            auto_flag: None,
             is_hls: item_is_hls(self),
         }
     }
@@ -146,6 +154,8 @@ impl ResumePlan {
             part_ranges: self.part_ranges,
             part_downloaded: self.part_downloaded,
             desired_connections: None,
+            auto_connections: self.item.connections == 0,
+            auto_flag: None,
             is_hls,
         }
     }

@@ -161,17 +161,25 @@ pub fn get_settings(state: State<'_, Arc<AppState>>) -> Result<Settings, PdmErro
 }
 
 #[tauri::command]
-pub fn save_settings(state: State<'_, Arc<AppState>>, settings: Settings) -> Result<(), PdmError> {
+pub async fn save_settings(
+    state: State<'_, Arc<AppState>>,
+    settings: Settings,
+) -> Result<(), PdmError> {
     log::info!(
-        "[ProxyDM] save_settings lang={} dl_dir={} max_conns={} tls_invalid={}",
+        "[ProxyDM] save_settings lang={} dl_dir={} max_conns={} max_active={} tls_invalid={}",
         settings.language,
         settings.download_dir,
         settings.max_connections,
+        settings.max_active_downloads,
         settings.danger_accept_invalid_certs
     );
 
     let result = state.settings.save(&settings)?;
     state.dm.set_global_rate_limit(settings.global_rate_limit);
+    state
+        .dm
+        .set_max_active_downloads(settings.max_active_downloads)
+        .await;
 
     if result.tls_changed {
         state.dm.clear_client_pool();

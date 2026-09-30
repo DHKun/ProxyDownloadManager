@@ -5,19 +5,20 @@ use std::sync::Mutex;
 const ALIGN: u64 = 4096;
 pub const MAX_CONNECTIONS: u32 = 64;
 const MIN_SPLIT: u64 = 2 * 1024 * 1024;
+/// Smallest planned range. Small enough that Auto can add workers all the way
+/// to its ceiling without splitting an in-flight transfer.
+const MIN_CHUNK: u64 = 2 * 1024 * 1024;
 
 pub fn align_up(v: u64) -> u64 {
     (v + ALIGN - 1) & !(ALIGN - 1)
 }
 
 /// Compute chunk size so each worker handles ~20 chunks.
-/// Formula: file_size / (connections × 20), clamped to [4MB, 64MB].
+/// Formula: file_size / (connections × 20), clamped to [MIN_CHUNK, 64MB].
 fn dynamic_chunk_size(file_size: u64, connections: u32) -> u64 {
     let conns = connections.max(1);
     let target = file_size / (conns as u64 * 20); // ~20 chunks/worker
-    target
-        .max(4 * 1024 * 1024) // min 4MB
-        .min(64 * 1024 * 1024) // max 64MB
+    target.max(MIN_CHUNK).min(64 * 1024 * 1024) // 64MB max
 }
 
 pub fn compute_chunks(file_size: u64, num_chunks: u32, _min_chunk_size: u64) -> Vec<Task> {
@@ -59,9 +60,15 @@ pub fn plan_chunks(
     max_connections: u32,
 ) -> ChunkPlan {
     let connections = compute_connection_count(file_size, requested_connections, max_connections);
+    let auto = requested_connections == 0 && max_connections == 0;
 
     let parts = if supports_range && file_size > 0 {
-        let num_conns = if connections > 0 {
+        let num_conns = if auto {
+            // Auto plans one range per *potential* connection, not just the
+            // conservative start, so the adaptive controller can add workers
+            // without splitting a transfer that is already in flight.
+            auto_plan_parts(file_size)
+        } else if connections > 0 {
             connections.min(MAX_CONNECTIONS)
         } else {
             1
@@ -96,6 +103,12 @@ pub fn plan_chunks(
     ChunkPlan { connections, parts }
 }
 
+/// Number of ranges Auto plans for a file. Matches the adaptive ceiling so
+/// every worker the controller can ask for has a queued range to take.
+pub fn auto_plan_parts(file_size: u64) -> u32 {
+    crate::engine::adaptive::ceiling_for(file_size).clamp(1, MAX_CONNECTIONS)
+}
+
 /// Resolve how many connections a download actually opens.
 ///
 /// `default_connections` is the settings value. `0` means Auto and the count
@@ -109,33 +122,33 @@ pub fn compute_connection_count(file_size: u64, requested: u32, default_connecti
     if default_connections > 0 {
         return default_connections.clamp(1, MAX_CONNECTIONS);
     }
-    auto_connections(file_size).clamp(1, MAX_CONNECTIONS)
+    auto_initial_connections(file_size).clamp(1, MAX_CONNECTIONS)
 }
 
-/// Initial Auto strategy. Capped at 8.
+/// Conservative Auto starting point. Not a cap: Auto raises it from measured
+/// throughput via `engine::adaptive`.
 ///
-/// TODO: start at 4 and raise only when throughput improves and retries stay low.
-/// A proxy does not get more than a direct connection; both stop at 8.
-pub fn auto_connections(file_size: u64) -> u32 {
-    auto_connections_for(file_size, false)
-}
-
-pub fn auto_connections_for(file_size: u64, via_proxy: bool) -> u32 {
+/// < 2 MiB → 1, everything else → 4. Large files deliberately do not start at
+/// 32/64; they ramp up only when the extra workers actually pay off.
+pub fn auto_initial_connections(file_size: u64) -> u32 {
     const MIB: u64 = 1024 * 1024;
-    let n = if file_size == 0 {
-        2
+    if file_size == 0 {
+        4
     } else if file_size < 2 * MIB {
         1
-    } else if file_size < 16 * MIB {
+    } else {
         4
-    } else {
-        8
-    };
-    if via_proxy {
-        n.min(8)
-    } else {
-        n
     }
+}
+
+/// Backwards-compatible alias. A proxy no longer lowers the Auto count — the
+/// measured throughput decides, direct or proxied.
+pub fn auto_connections(file_size: u64) -> u32 {
+    auto_initial_connections(file_size)
+}
+
+pub fn auto_connections_for(file_size: u64, _via_proxy: bool) -> u32 {
+    auto_initial_connections(file_size)
 }
 
 /// Check if there's enough disk space for the download.
@@ -337,8 +350,8 @@ mod tests {
         // The Kali ISO size. Auto plans several parts, not one full-file task.
         let size = 4_831_174_656u64;
         let plan = plan_chunks(size, 0, true, 0);
-        assert_eq!(plan.connections, 8);
-        assert_eq!(plan.parts.len(), 8);
+        assert_eq!(plan.connections, 4);
+        assert_eq!(plan.parts.len(), 64);
         let ranges: Vec<crate::engine::part_progress::PartRange> = plan
             .parts
             .iter()
@@ -351,21 +364,44 @@ mod tests {
             &ranges,
             &vec![0; ranges.len()],
         );
-        assert_eq!(tasks.len(), 8);
+        assert_eq!(tasks.len(), 64);
         assert_eq!(tasks.iter().map(|t| t.length).sum::<u64>(), size);
         assert_eq!(compute_chunks(size, 1, 0).len(), 1);
         assert_eq!(compute_chunks(size, 0, 0).len(), 1);
     }
 
     #[test]
-    fn auto_connections_follows_size_buckets() {
+    fn auto_connections_start_conservative_and_ignore_proxy() {
         assert_eq!(auto_connections(1024), 1);
         assert_eq!(auto_connections(3 * 1024 * 1024), 4);
-        assert_eq!(auto_connections(32 * 1024 * 1024), 8);
-        assert_eq!(auto_connections(200 * 1024 * 1024), 8);
-        assert_eq!(auto_connections(2 * 1024 * 1024 * 1024), 8);
-        assert_eq!(auto_connections_for(2 * 1024 * 1024 * 1024, true), 8);
-        assert_eq!(auto_connections(600 * 1024 * 1024), 8);
+        assert_eq!(auto_connections(32 * 1024 * 1024), 4);
+        assert_eq!(auto_connections(200 * 1024 * 1024), 4);
+        assert_eq!(auto_connections(2 * 1024 * 1024 * 1024), 4);
+        // A proxy does not lower the Auto count; throughput decides.
+        assert_eq!(auto_connections_for(2 * 1024 * 1024 * 1024, true), 4);
+        assert_eq!(auto_connections_for(600 * 1024 * 1024, true), 4);
+    }
+
+    #[test]
+    fn auto_plans_enough_parts_for_the_adaptive_ceiling() {
+        // Auto's planned part count must cover every worker the controller can
+        // request, otherwise scale-up has nothing to hand out.
+        for (size, ceiling) in [
+            (16u64 * 1024 * 1024, 8u32),
+            (32 * 1024 * 1024, 16),
+            (64 * 1024 * 1024, 32),
+            (128 * 1024 * 1024, 64),
+            (4_831_174_656, 64),
+        ] {
+            let plan = plan_chunks(size, 0, true, 0);
+            assert_eq!(
+                plan.parts.len(),
+                ceiling as usize,
+                "size={size} ceiling={ceiling}"
+            );
+            let total: u64 = plan.parts.iter().map(|p| p.end - p.start).sum();
+            assert_eq!(total, size);
+        }
     }
 
     #[test]

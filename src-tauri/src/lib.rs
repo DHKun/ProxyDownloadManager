@@ -209,7 +209,7 @@ pub fn run() {
             let next_id_start = db.max_id().unwrap_or(0) + 1;
             let ledger = Arc::new(crate::state::ledger::ProgressLedger::new(db));
             let worker_pool = crate::worker::WorkerPool::new(
-                8,
+                settings.max_active_downloads,
                 event_tx.clone(),
                 danger_accept_invalid_certs,
                 next_id_start,

@@ -261,6 +261,8 @@ fn make_cfg(
         part_downloaded: vec![0; parts.len()],
         part_ranges: parts,
         desired_connections: None,
+        auto_connections: false,
+        auto_flag: None,
         is_hls: false,
     }
 }

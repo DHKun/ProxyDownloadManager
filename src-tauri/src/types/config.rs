@@ -51,6 +51,11 @@ pub struct Settings {
     /// Bytes per second. `0` is unlimited. Missing in an older file means unlimited.
     #[serde(default)]
     pub global_rate_limit: u64,
+    /// How many downloads may run at the same time. `0` is unlimited; a
+    /// non-zero value is an explicit user limit and only then are extra
+    /// downloads queued. Missing in an older file means unlimited.
+    #[serde(default)]
+    pub max_active_downloads: u32,
     pub default_proxy: String,
     pub home_dir: String,
     pub language: String,
@@ -85,6 +90,8 @@ impl Default for Settings {
             silent_startup: default_silent_startup(),
             proxies: std::collections::HashMap::new(),
             global_rate_limit: 0,
+            // Unlimited simultaneous downloads by default — no hidden cap.
+            max_active_downloads: 0,
             default_proxy: String::new(),
             home_dir: home.join(".ProxyDM").to_string_lossy().to_string(),
             language: String::from("en"),
@@ -114,6 +121,8 @@ mod tests {
         let s = Settings::default();
         assert_eq!(s.max_connections, 0); // default is auto
         assert_eq!(s.global_rate_limit, 0);
+        // No hidden cap on simultaneous downloads.
+        assert_eq!(s.max_active_downloads, 0);
         assert!(s.max_retries > 0);
         assert!(!s.download_dir.is_empty());
         assert_eq!(s.file_conflict, FileConflictPolicy::Rename);

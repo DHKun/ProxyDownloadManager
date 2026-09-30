@@ -1,3 +1,4 @@
+pub mod adaptive;
 pub mod chunk;
 pub mod concurrent;
 
@@ -246,6 +247,8 @@ mod tests {
             },
             part_downloaded: vec![],
             desired_connections: None,
+            auto_connections: false,
+            auto_flag: None,
             is_hls: false,
         }
     }
