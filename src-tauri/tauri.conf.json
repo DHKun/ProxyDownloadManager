@@ -49,7 +49,9 @@
         "type": "embedBootstrapper"
       },
       "wix": null,
-      "nsis": null
+      "nsis": {
+        "template": "installer/installer.nsi"
+      }
     }
   }
 }
