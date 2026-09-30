@@ -3,7 +3,20 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/spec/v2.0.0.html)。
 
-## [Unreleased]
+## [0.17.0] - 2026-09-30
+
+### Added
+
+- 设置里新增“同时下载任务数”（默认不限制），取代此前固定 8 个并发下载的隐藏上限
+- Auto 连接数改为按实测吞吐自适应升档/降档（4→8→16→32→64），实测无提升或有新重试/卡顿就回退；Manual 选择完全按用户设置执行，不再被动态改写
+- 探测/下载日志新增协议与启动分阶段耗时（protocol / first-header / first-body / first-progress），每 5 秒一条 `[perf]` 摘要
+
+### Changed
+
+- 全应用只有一个 `NetworkPool`：Direct 或同一代理下的探测、所有 Range worker、所有重试共享同一个 `reqwest::Client`，不再每个 worker/每次重试新建
+- 探测 `Range: bytes=0-0` 的小 206 body 会被安全读完（上限 64 KiB），让 HTTP/1.1 连接回到连接池供随后的下载复用；巨大 200 响应仍然直接丢弃、不读入内存
+- Auto 初始连接数收敛为小文件 1、其余 4，再按吞吐升档；不再按“是否走代理”写死上限
+- Windows NSIS 安装包在升级/同版本重装时不再弹出 “Already Installed” 选择页：检测到旧版本后自动运行旧卸载程序（静默、不勾选删除应用数据），旧文件释放后再安装新版本；降级仍遵守 allowDowngrades，旧卸载失败会明确报错并停止
 
 ## [0.16.3] - 2026-09-29
 
